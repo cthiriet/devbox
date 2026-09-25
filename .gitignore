@@ -1,0 +1,56 @@
+.env
+*.tfstate
+*.tfstate.*
+.terraform/
+terraform.tfvars
+bin/
+
+# .terraform.lock.hcl is NOT ignored, and stopped being so on 20/08. It was, back when
+# one Mac was the only thing that ever ran terraform here. The dashboard is a second
+# executor, on Linux, against the same states: without a committed lock each would
+# resolve `hcloud >= 1.45, < 2.0` on its own day and could run a different provider.
+# Every lock therefore carries BOTH platforms, recorded with
+# `terraform providers lock -platform=darwin_arm64 -platform=linux_amd64`. A lock
+# generated on macOS alone holds only darwin hashes, and linux init fails on
+# "the local package does not match any of the checksums".
+
+# The dashboard's engine/ is a build artefact: devbox, prelude.sh, profiles/ and the .tf
+# sources, copied from this repository's root so the rsync of the site carries them.
+dashboard/engine/
+
+# One pattern, not one per package. The workspace hoists most dependencies to the root
+# and leaves a link farm in each member, so a list of named directories goes stale the
+# day a fourth package appears — and the first thing it lets through is a few thousand
+# files nobody meant to commit.
+node_modules/
+dashboard/data/
+dashboard/.test-data/
+# public/ is now a build artefact whole: Vite deposits dashboard/web's bundle there (see
+# dashboard/web/vite.config.ts), where there used to be one generated stylesheet.
+dashboard/public/
+
+# The SPA's shell, written at build time by dashboard/scripts/build-shell.ts: a copy of
+# public/index.html deposited where the application rsync carries it, public/ being excluded.
+dashboard/shell/
+/.ui-review/
+
+# Le manuel francais d'origine, garde ici tel quel. Il nomme des profils prives — leur
+# VPN, leurs cles, leur plateforme de deploiement, leurs comptes de test — et ne peut pas
+# partir dans un depot public sans etre expurge d'abord. Rien n'est perdu, rien n'est
+# publie tant que ce n'est pas fait.
+MANUAL.fr.md
+
+# A private extension of the dashboard (src/extension.ts): deposited here by a deployment,
+# never committed. Its absence is the open-source dashboard, where every account orders on
+# its own cloud accounts.
+dashboard/extension/
+dashboard/web/src/extension/deposited/
+
+# Never in this repository, wherever they land: macOS litter, environment files, Terraform
+# variables, databases.
+.DS_Store
+.env.*
+*.tfvars
+*.auto.tfvars
+*.db
+*.sqlite

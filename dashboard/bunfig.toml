@@ -1,0 +1,4 @@
+[test]
+# Isolates the tests from the real Terraform state, the real ~/.ssh/config and the real
+# cloud credentials. See tests/prepare.ts.
+preload = ["./tests/prepare.ts"]

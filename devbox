@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# devbox — the entry point. Two renderers, one executor.
+#
+# The tool itself is devbox-core, beside this file: 2000 lines of bash that talk to three
+# cloud APIs, drive Terraform, and write ~/.ssh/config. It has not moved. What this script
+# decides is only who draws the answer.
+#
+#   a terminal          cli/, an Ink app on Bun — tables, live phases, a confirmation
+#                       before `down`, the tokens asked for before the run starts, and
+#                       `devbox` with no verb at all opening a full-screen window
+#   anything else       devbox-core, exactly as it has always behaved
+#
+# "anything else" is deliberately generous, because every one of these cases is somebody
+# depending on the old bytes:
+#
+#   stdout is not a tty   `devbox ls | grep`, and the dashboard's Bun.spawn, which pipes both
+#                         streams and would otherwise be parsing a spinner
+#   --json anywhere       the interface. It must be identical whoever asks, and routing it
+#                         through a renderer could only make it less so
+#   DEVBOX_PLAIN=1        the way out, for when the rendering is the problem — and the way
+#                         to reach the core's own `read -rs` prompts if this layer ever
+#                         fails to anticipate a secret
+#   no bun, no cli/node_modules
+#                         a fresh clone, or the server. `bun install` in cli/ is what turns
+#                         the renderer on, and nothing breaks while it has not been run
+#
+# The dashboard never reaches this file at all: build-engine.ts copies devbox-core into
+# engine/devbox, so the service runs the bash directly and needs no Bun.
+set -euo pipefail
+
+# The directory of the REAL file, symlinks followed.
+#
+# `dirname "${BASH_SOURCE[0]}"` is the directory it was *invoked* through, and the
+# documented install is a symlink — `ln -sfn $(PWD)/devbox ~/.local/bin/devbox` — so that reads
+# ~/.local/bin and everything beside this file goes missing. `readlink -f` would do it in
+# one line on Linux and is not in BSD readlink on every macOS this has to run on, hence
+# the loop.
+resolve_here() {
+  local src=$1 dir
+  while [ -L "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case $src in /*) ;; *) src=$dir/$src ;; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+HERE=$(resolve_here "${BASH_SOURCE[0]}")
+CORE=$HERE/devbox-core
+
+render=1
+[ -t 1 ] || render=0
+[ -z "${DEVBOX_PLAIN:-}" ] || render=0
+command -v bun >/dev/null 2>&1 || render=0
+[ -d "$HERE/cli/node_modules/ink" ] || render=0
+# ${@+"$@"} rather than "$@": bash 3.2, which is what macOS ships, treats an unset $@ as an
+# unbound variable under `set -u`.
+for arg in ${@+"$@"}; do
+  [ "$arg" = --json ] && render=0
+done
+
+# DEVBOX_HOME so the renderer can name profiles/ and tf/ in a footer without guessing where
+# it was installed from; DEVBOX_CORE so it spawns this repository's core and not whatever
+# else is on PATH. Exported before the branch, because the core reads DEVBOX_HOME too.
+export DEVBOX_HOME=$HERE
+export DEVBOX_CORE=$CORE
+
+[ "$render" = 1 ] || exec "$CORE" ${@+"$@"}
+
+exec bun "$HERE/cli/src/index.tsx" ${@+"$@"}

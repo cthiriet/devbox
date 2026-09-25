@@ -1,0 +1,59 @@
+# Drives the full-screen window through a pty, because that is the only way to find out
+# whether it answers the keyboard at all. See tests/window.test.ts for why this exists.
+set timeout 25
+spawn env DEVBOX_CORE=$env(DEVBOX_CORE) DEVBOX_HOME=$env(DEVBOX_HOME) DEVBOX_REMOTE= bun $env(DEVBOX_ENTRY)
+
+expect {
+  "devbox" {}
+  timeout { puts "\nFAILED: the menu never drew"; exit 2 }
+}
+sleep 1
+
+# Down one row, then open. `up` is the second entry, so a cursor that did not move opens
+# the fleet instead — the profile step naming a profile is therefore proof of both.
+send "j"
+sleep 1
+send "\r"
+expect {
+  "claude" {}
+  timeout { puts "\nFAILED: the profile step never listed a profile"; exit 3 }
+}
+
+# Enter again: the shape step, fetched with the floors of the profile under the cursor.
+sleep 1
+send "\r"
+expect {
+  "cx33" {}
+  timeout { puts "\nFAILED: the shape step never listed an offer"; exit 4 }
+}
+
+# Escape goes back one step rather than out, which is what makes the second question
+# answerable twice. The pause is not padding: a key sent in the same instant the previous
+# screen was replaced lands between two mounts and is read by neither.
+sleep 1
+send "\033"
+expect {
+  "what the machine becomes" {}
+  timeout { puts "\nFAILED: escape did not come back to the profile"; exit 5 }
+}
+
+# Out to the menu, into the fleet, and Enter on a machine. That last one is the gesture
+# the window exists to make cheap and the one thing it cannot do itself: the session LEAVES
+# the alternate screen, so what proves it worked is the core being handed the name in an
+# ordinary terminal.
+sleep 1
+send "\033"
+sleep 1
+send "\r"
+expect {
+  "devbox-aaaa1" {}
+  timeout { puts "\nFAILED: the machines screen never listed anything"; exit 6 }
+}
+sleep 1
+send "\r"
+expect {
+  "ssh devbox-aaaa1" {}
+  timeout { puts "\nFAILED: enter on a machine did not hand ssh the terminal"; exit 7 }
+}
+expect eof
+puts "\nWINDOW OK"

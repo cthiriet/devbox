@@ -1,0 +1,29 @@
+{
+  "name": "devbox-dashboard",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "engine": "bun scripts/build-engine.ts",
+    "web:install": "cd web && bun install --silent",
+    "web:build": "cd web && bunx --bun vite build",
+    "build": "bun run engine && bun run web:install && bun run web:build && bun run shell",
+    "dev": "bun run engine && bun --hot server.ts",
+    "dev:web": "cd web && bunx --bun vite",
+    "dev:web:node": "cd web && node node_modules/vite/bin/vite.js",
+    "start": "NODE_ENV=production bun server.ts",
+    "test": "bun test",
+    "check": "tsc --noEmit && cd web && bunx --bun tsc -b",
+    "deploy:rehearse": "bash scripts/simulate-deploy.sh",
+    "verify": "bun test && bun run check && bun run deploy:rehearse",
+    "shell": "bun scripts/build-shell.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/ssh2": "^1.15.5",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "ssh2": "^1.17.0"
+  }
+}

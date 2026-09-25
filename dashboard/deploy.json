@@ -1,0 +1,36 @@
+{
+  "port": 3021,
+  "publicDir": "public",
+  "build": "bun run build",
+  "install": "bun install --production",
+  "start": "/usr/local/bin/bun run server.ts",
+  "routes": [
+    "/api/*",
+    "/job/*",
+    "/jobs",
+    "/machine/*",
+    "/new",
+    "/new/*",
+    "/orphans",
+    "/profiles",
+    "/profiles/*",
+    "/secrets",
+    "/login",
+    "/account",
+    "/"
+  ],
+  "env": {
+    "NODE_ENV": "production"
+  },
+  "exclude": [
+    "node_modules",
+    "data",
+    "tests",
+    ".test-data",
+    "web"
+  ],
+  "memory": "1G",
+  "headers": {
+    "X-Robots-Tag": "noindex, nofollow, noarchive"
+  }
+}

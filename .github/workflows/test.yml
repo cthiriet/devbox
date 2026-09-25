@@ -1,0 +1,116 @@
+# Both suites, the type checks and the deployment rehearsal, on every push and pull request
+# to main.
+#
+# None of it reaches a cloud. The tests fake terraform and the providers, and the rehearsal
+# starts the server on 127.0.0.1 with no credentials at all, which it is designed to
+# survive. So this workflow declares no secret, and it should never need one: a test that
+# wants a real token is a test that bills someone.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push makes the run in flight worthless: it tests a tree nobody will merge.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # The version the workstation runs, and the one docs/deploy.md tells a server to pin.
+      TERRAFORM_VERSION: 1.15.9
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.11
+
+      # Each of these is either `need`ed by devbox-core on a path the tests walk (curl,
+      # openssl, nc, ssh-keygen, ssh-keyscan), or one a test skips itself without (jq, awk,
+      # lsof, shasum, ssh). A skipped test is a green test, and green would then say
+      # nothing. So they are installed when missing and asserted afterwards: a runner image
+      # that drops one fails here, by name, instead of passing with fewer tests.
+      - name: System tools the suites call
+        run: |
+          declare -A package=(
+            [jq]=jq [awk]=mawk [curl]=curl [openssl]=openssl [nc]=netcat-openbsd
+            [ssh]=openssh-client [ssh-keygen]=openssh-client [ssh-keyscan]=openssh-client
+            [lsof]=lsof [rsync]=rsync [shasum]=perl [unzip]=unzip
+          )
+          missing=()
+          for tool in "${!package[@]}"; do
+            command -v "$tool" >/dev/null || missing+=("${package[$tool]}")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends $(printf '%s\n' "${missing[@]}" | sort -u)
+          fi
+          for tool in "${!package[@]}"; do
+            command -v "$tool" >/dev/null || { echo "::error::$tool is still not in PATH"; exit 1; }
+          done
+
+      # devbox-core's `up` asks for terraform before anything else, and one test walks that
+      # road without the fake: core-gcp.test.ts, the refusal that names both GCP
+      # credentials. The runner image ships no terraform. Pinned and checksum-verified, the
+      # way docs/deploy.md asks a server to install it: nothing here upgrades it on its own.
+      - name: Terraform, pinned and verified
+        run: |
+          v=$TERRAFORM_VERSION
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://releases.hashicorp.com/terraform/${v}/terraform_${v}_linux_amd64.zip"
+          curl -fsSLO "https://releases.hashicorp.com/terraform/${v}/terraform_${v}_SHA256SUMS"
+          sha256sum --ignore-missing -c "terraform_${v}_SHA256SUMS"
+          mkdir -p "$RUNNER_TEMP/bin"
+          unzip -o -q "terraform_${v}_linux_amd64.zip" terraform -d "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/terraform" version
+
+      # The GCP tests describe a server with no gcloud by removing from PATH every
+      # directory that holds one (cli/tests/harness.ts, pathWithout). The runner image
+      # installs gcloud from apt, as a link in /usr/bin, and dropping /usr/bin - and /bin,
+      # which is the same directory - takes bash, jq and curl with it: every GCP test would
+      # die on `env: bash` before saying anything about GCP. Deleting the link makes gcloud
+      # absent without making everything else absent too.
+      - name: No gcloud on PATH
+        run: |
+          IFS=: read -ra dirs <<<"$PATH"
+          for dir in "${dirs[@]}"; do
+            if [ -e "$dir/gcloud" ]; then sudo rm -f "$dir/gcloud"; fi
+          done
+          hash -r
+          if command -v gcloud; then echo "::error::gcloud is still in PATH"; exit 1; fi
+
+      # The workspace root holds cli/ and dashboard/ under one bun.lock. dashboard/web is
+      # not a member and carries its own lock; the build would install it anyway, without
+      # --frozen-lockfile, so it is installed here first and the build finds nothing to do.
+      - name: Install the workspace
+        run: bun install --frozen-lockfile
+
+      - name: Install dashboard/web
+        working-directory: dashboard/web
+        run: bun install --frozen-lockfile
+
+      - name: Both suites
+        run: make test
+
+      - name: Type checks, server and web
+        working-directory: dashboard
+        run: bun run check
+
+      # Build, rsync with deploy.json's exclusions, `bun install --production` on the copy
+      # alone, start it, GET / must be the SPA's shell, and the engine must still be
+      # devbox-core byte for byte. What the server would run is what survives that copy.
+      - name: Deployment rehearsal
+        working-directory: dashboard
+        run: bun run deploy:rehearse

@@ -1,0 +1,3174 @@
+#!/usr/bin/env bash
+# devbox — one cloud VM per working session, provisioned at boot, joined over SSH.
+#
+# This file is the EXECUTOR. `devbox`, beside it, is a fifty-line shim that decides who draws
+# the answer: a terminal gets cli/, an Ink app on Bun; a pipe, a `--json`, a DEVBOX_PLAIN=1,
+# a machine without Bun, all get this file, byte for byte as it has always behaved. The
+# dashboard never meets the shim at all — build-engine.ts deposits THIS file as engine/devbox,
+# so the service depends on bash and on nothing else.
+#
+# Nothing above this file decides anything. The renderer reads `--json`, echoes the `==> `
+# narration below, and asks for the two secrets this script would otherwise prompt for. A
+# verb it does not recognise it hands straight back here.
+#
+# Devbox used to order a bare metal host, install k3s and KubeVirt on it, and serve
+# sandbox VMs behind a Go API. That version lives on the `kubevirt` branch; it worked, and
+# it wanted forty minutes and 0.26 EUR/h where an ordinary cloud instance wants five
+# minutes and 0.014.
+#
+#   devbox up [--profile P] [--repo URL] [--cloud X] [--name N]
+#          [--min-cpu N --min-ram N --min-disk N] [--type T] [--no-seed]
+#   devbox seed [N] [--profile P]   phase 2 alone: re-runnable, and how you rotate a token
+#   devbox info [N] [--json]        the connection details, written to be typed on a phone
+#   devbox ls [--json]              every machine, and what they cost per hour
+#   devbox profiles [--json]        what a machine can be made into, and what each needs
+#   devbox probe [--cloud X] [--all] [--json] [--min-ram N ...] [--refresh]
+#   devbox orphans [--cloud X] [--json]   what the providers run that no state knows about
+#   devbox ssh [N]                  the session itself, through the Host block
+#   devbox sync                     reconcile ~/.ssh/config with the dashboard's fleet
+#   devbox tunnel [N] [--port P] [--close]   the forwards, without a session
+#   devbox down [N]                 destroy it, and stop the meter
+#
+# DEVBOX_REMOTE points this script at the dashboard, and then it orders nothing itself: it
+# posts the job, echoes the log, and does the two things a server cannot do for a
+# workstation, which are accepting the host key and writing the Host block. That is what
+# keeps ONE executor and ONE state when a machine can be created from a phone. There is no
+# silent fallback to the local state when the dashboard is unreachable, because falling
+# back would rebuild the second fleet all of this exists to avoid; `DEVBOX_REMOTE= devbox ls`
+# reads it knowingly. `devbox sync` is what gives this Mac a Host block for a machine that
+# was created somewhere else.
+#
+# The dashboard runs its OWN copy of this file, deposited by a deployment. Editing this
+# one changes nothing about what a remote job does until the dashboard has been redeployed
+# (`cd dashboard && bun run verify` first), so every remote verb now compares the two by
+# their bytes before anything else and says one line when they differ — or when it could
+# not find out, which reads differently on purpose.
+#
+# --json is an interface, not a screen. `ls`, `info`, `profiles`, `probe` and `orphans`
+# each answer in JSON so something other than a terminal can consume them: the dashboard
+# does, and it must never have to parse a table that was aligned for a human.
+#
+# `orphans` asks the PROVIDER what it is running and subtracts what the state knows. An
+# apply killed halfway leaves a server billing with nothing recording it, and no other
+# command would ever show it again — `down` asks too, but only once the last machine is
+# gone, which is exactly when nothing is left to trigger it.
+#
+# WHAT a machine becomes is a profile, not a property of this tool. A profile is a shell
+# script with a declarative header — the repository to clone, the secrets to push, the
+# template to order, the port to forward — and it is the only file that knows what the
+# machine is for, and there is no default one: this tool does not decide what a machine is
+# for. Yours go in ~/.config/devbox/profiles/ and shadow the repository's, so they never need
+# to be committed here. `devbox profiles` lists them.
+#
+# The two phases are split on "does this need a secret", which is a fact about the metadata
+# service and not an opinion: user-data is readable by any process on the machine and
+# cloud-init keeps a copy on disk. Phase 1 is cloud-init and builds a genuinely generic
+# box — the dev user and its key, Docker with buildx, the MTU service, and the handful of
+# tools every profile would install anyway. Node, Chrome and k3s used to be here and are
+# not: they belong to the profiles that want them, and a profile that does not want them
+# should not pay three minutes of install for their presence. Phase 2 is the
+# profile, which travels at `devbox seed` over the SSH channel with its secrets, into tmpfs.
+# `up` chains both.
+#
+# Several machines coexist, on one cloud or across the three: each gets a Terraform
+# workspace, its own resource names, its own Host block in ~/.ssh/config and its own local
+# forward port. The name is optional everywhere — with a single machine there is nothing
+# to disambiguate, with several the commands refuse to guess.
+#
+# Three clouds answer the same seven outputs — ip, user, port, cloud, region,
+# instance_type, hourly_eur — and nothing above tf/ knows anything else. Adding a fourth
+# is writing a Terraform root that answers those seven.
+set -euo pipefail
+
+# The directory of the REAL file, symlinks followed.
+#
+# `dirname "${BASH_SOURCE[0]}"` is the directory it was *invoked* through, and the
+# documented install is a symlink — `ln -sfn $(PWD)/devbox ~/.local/bin/devbox` — so that reads
+# ~/.local/bin and everything beside this file goes missing. `readlink -f` would do it in
+# one line on Linux and is not in BSD readlink on every macOS this has to run on, hence
+# the loop.
+resolve_here() {
+  local src=$1 dir
+  while [ -L "$src" ]; do
+    dir=$(cd -P "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case $src in /*) ;; *) src=$dir/$src ;; esac
+  done
+  cd -P "$(dirname "$src")" && pwd
+}
+HERE=$(resolve_here "${BASH_SOURCE[0]}")
+
+# Four printfs, this early because the configuration below has something to announce
+# before it is read. They depend on nothing and are used everywhere; the plumbing section
+# further down holds the rest.
+bold()  { printf '\033[1m%s\033[0m\n' "$*"; }
+log()   { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+warn()  { printf '\033[1;33m/!\\\033[0m %s\n' "$*" >&2; }
+die()   { printf '\033[1;31mx\033[0m %s\n' "$*" >&2; exit 1; }
+# The version of this file, which is its bytes — see version_gate. ${BASH_SOURCE[0]} and
+# not a path rebuilt from HERE: the file is called devbox-core in the repository and devbox on
+# the server, and reading THROUGH the install symlink already yields the target's bytes,
+# so resolve_here is not what this one needs. Made absolute at once, because that path can
+# be relative and it is read much later, from wherever the command was run.
+SELF=${BASH_SOURCE[0]}
+case $SELF in /*) ;; *) SELF=$PWD/$SELF ;; esac
+# Where the Terraform roots and their state live. A variable, because the dashboard runs
+# this script from a systemd service whose code directory is deposited by `rsync --delete`
+# and mounted read-only: state kept beside the sources would be wiped by the next
+# deployment. There it points into the service's data directory, which is the only path
+# it may write.
+TF_ROOT=${DEVBOX_TF_ROOT:-$HERE/tf}
+KEY=${DEVBOX_KEY:-$HOME/.ssh/devbox}
+CONFIG_DIR=${DEVBOX_CONFIG_DIR:-$HOME/.config/devbox}
+# Where secret_value looks before it asks. A variable, because that directory means two
+# different things depending on who runs this script. On a workstation it is a cache:
+# the value is typed at the keyboard once, written at 0600, and read back by every later
+# run. Inside the dashboard's systemd service nobody is sitting at a keyboard, and the
+# directory is instead a read-only deposit the platform vault fills at 0400, so the default
+# under $HOME would leave `seed` dying on the first secret it needs. secret_value writes
+# there only when it had to prompt, which is precisely what cannot happen in the service,
+# so a deposit it may not write to costs nothing.
+SECRETS_DIR=${DEVBOX_SECRETS_DIR:-$CONFIG_DIR/secrets}
+
+# The tool was called mtk before it was called devbox, and devbox before that. Its
+# credentials for three clouds and its two agent tokens live under ~/.config, and asking
+# someone to move them by hand is how a rename turns into an afternoon. Moved once,
+# announced, never mentioned again.
+#
+# The arrow points the other way now, and that is the whole hazard of the 27/08 rename:
+# the previous version of this function moved ~/.config/devbox INTO ~/.config/mtk, so
+# shipping it unchanged would have undone the rename on every invocation, silently.
+migrate_from_mtk() {
+  local old new
+  for pair in "$HOME/.config/mtk:$HOME/.config/devbox" "$HOME/.cache/mtk:$HOME/.cache/devbox"; do
+    old=${pair%%:*}; new=${pair##*:}
+    [ -d "$old" ] || continue
+    if [ -e "$new" ]; then
+      warn "$old and $new both exist — leaving both alone, merge them by hand"
+      continue
+    fi
+    install -d -m 700 "$(dirname "$new")"
+    mv "$old" "$new" && log "moved $old to $new (the tool is called devbox now)"
+  done
+
+  # The directory is only half of it. .env holds `DEVBOX_REMOTE=`, and a file still saying
+  # MTK_REMOTE reads as no remote at all: `up` would stop asking the server and start
+  # driving terraform from this Mac, against the operator's own credentials, on the one
+  # verb that spends money. It would say nothing while doing it, which is why this is not
+  # left to the reader.
+  #
+  # Outside the loop above, and keyed on the file rather than on the old directory: this
+  # machine's ~/.config/mtk is already moved, and the stale key would have survived it.
+  # Idempotent by construction — after one pass there is no MTK_ line left to match.
+  local env=$CONFIG_DIR/.env
+  if [ -f "$env" ] && grep -q '^[[:space:]]*MTK_' "$env"; then
+    local tmp; tmp=$(mktemp "$env.XXXXXX")
+    if sed 's/^\([[:space:]]*\)MTK_/\1DEVBOX_/' "$env" > "$tmp"; then
+      chmod 600 "$tmp" && mv "$tmp" "$env" \
+        && log "renamed the MTK_ settings in $env to DEVBOX_ (the tool is called devbox now)"
+    else
+      rm -f "$tmp"
+      warn "could not rewrite $env — its MTK_ lines are read by nothing now"
+    fi
+  fi
+}
+migrate_from_mtk
+SSH_CONFIG=$HOME/.ssh/config
+KNOWN_HOSTS=$HOME/.ssh/known_hosts
+# Empty by default and drawn only by `up`. A random name per deployment means nothing to
+# invent and nothing to collide, and it makes the machine's identity visible everywhere at
+# once: SSH alias, Terraform workspace, cloud resources, and the shell prompt inside.
+NAME=${DEVBOX_NAME:-}
+PIN=
+# Set by --quiet. Suppresses the closing summary and nothing else.
+QUIET=
+
+# The dashboard, when this Mac delegates to it instead of running Terraform itself.
+#
+# Two executors writing unlocked local state is the failure this variable exists to
+# prevent, and a machine created from a phone would otherwise appear in no `devbox ls` and in
+# no ~/.ssh/config here. With it set, this script orders nothing: it posts the job, echoes
+# the log, and then does the two things the server cannot do for it, which are
+# refresh_known_hosts and write_ssh_config.
+#
+# There is deliberately NO silent fallback to the local state when the dashboard cannot be
+# reached. Falling back would quietly recreate the second fleet all of this exists to
+# avoid; `DEVBOX_REMOTE= devbox ls` is the way back, taken knowingly.
+#
+# Read from the environment first, then from ~/.config/devbox/.env, which is where a setting
+# of THIS workstation belongs: pointing devbox at a dashboard is not something to re-export
+# in every shell, and .env.tf sits next to it holding the same kind of thing.
+#
+# The environment wins even when it is EMPTY, which is what keeps `DEVBOX_REMOTE= devbox ls`
+# working as the documented way back to the local state once the file exists.
+if [ -n "${DEVBOX_REMOTE+set}" ]; then
+  REMOTE=$DEVBOX_REMOTE
+elif [ -f "$CONFIG_DIR/.env" ]; then
+  REMOTE=$(sed -n 's/^[[:space:]]*DEVBOX_REMOTE[[:space:]]*=[[:space:]]*//p' "$CONFIG_DIR/.env" \
+           | tail -1 | tr -d "\"'")
+else
+  REMOTE=
+fi
+REMOTE=${REMOTE%/}
+# The single place the repository is named. stack.sh keeps the same default so it stays
+# runnable by hand on the machine, but seed passes this one through, so editing here is
+# enough.
+# The profile decides what a machine is for: which repository, which secrets, which agent,
+# which port. There is NO default, since 24/09. It was `bare`, the one profile that promised
+# nothing - a machine, and a repository if you declared one - and it went: a machine with
+# nothing on it is what an agent is asked to fill, and a profile is worth having for the agent,
+# the tokens and the repository it puts there. Any other default would be this tool deciding
+# what your machine is for, so `up` and `seed` refuse without one (profile_path). Personal
+# profiles shadow the repository's, so yours never need to be committed here; DEVBOX_PROFILE
+# picks one for good.
+PROFILE=${DEVBOX_PROFILE:-}
+PROFILE_DIRS="$CONFIG_DIR/profiles $HERE/profiles"
+REPO_URL=
+CLOUDS_IMPLEMENTED="hetzner scaleway gcp"
+
+# The template, and why it is not a preference.
+#
+# x86 is what the three cloud probes ask for, and it is no longer a constraint: Google
+# shipped Chrome for arm64 Linux on 30/07/2026, and prelude.sh reads the architecture
+# instead of pinning it — install_node and install_chrome both take it from
+# `dpkg --print-architecture`, so a profile follows the machine it was given.
+#
+# The three probes stay on x86 anyway, and that is now a PRICE decision rather than a
+# compatibility one. Measured on the Hetzner API on 25/08, location fsn1: cax21 (arm,
+# 4/8/80) at 0.0168 against cx33 (x86, same shape) at 0.0136, and cax31 at 0.0336 against
+# cx43 at 0.0256. Shared x86 has become cheaper than ARM there, so lifting the filter
+# would widen the search and change nothing about what it picks.
+#
+# 4 vCPU / 8 GB is measured, and it replaces the 8/16 this was first written with. That
+# first figure came from profiles/full.sh, on the kubevirt branch, asking KubeVirt for
+# 6 vCPU and 12 Gi, backed by
+# a 13/08 measurement showing more cores bought nothing — but that measurement was of the
+# BOOT of a pre-baked image to a served app (72 s -> 59 s), not of the four image builds
+# that dominate a cold start. It sized this machine using the wrong phase.
+#
+# Measured on 19/08, same protocol on both, cold BuildKit cache, stack running alongside:
+#
+#            cold rebuild of the four images   peak memory
+#   cx43     4 min 33 s                        3 468 MB of 15 613
+#   cx33     2 min 3 s                         2 801 MB of 7 751
+#
+# The cheaper machine was the faster one, which the shapes cannot explain — cx33 showed
+# zero steal, cx43 was never sampled for it, so the speed gap is not attributable and is
+# not the argument. The argument is the memory: 2.8 GB at the worst moment leaves 4.9 GB
+# spare with no swap, and nothing was ever OOM-killed. 16 GB was four times the need.
+#
+# What this has NOT measured is the machine's actual job: an agent driving a headless
+# Chrome WHILE the stack rebuilds. Chrome is worth a gigabyte or so on its own. If that
+# turns out to bite, the knob is right here and the way back costs 1.2 centime an hour:
+#
+#   DEVBOX_MIN_MEMORY_GB=16 devbox up
+#
+# The disk floor stays at 80 GB, which is what cx33 offers exactly: the four images plus
+# node_modules plus Postgres came to 14 GB, so the margin is real but not generous.
+MIN_CORES=${DEVBOX_MIN_CORES:-4}
+MIN_MEMORY_GB=${DEVBOX_MIN_MEMORY_GB:-8}
+MIN_DISK_GB=${DEVBOX_MIN_DISK_GB:-80}
+
+# Europe by default, and this one IS a preference, so it is a variable. The gabarit says
+# nothing about latency, and the cheapest x86 offer of the day is regularly in Ashburn
+# or Singapore — fine for a build farm, miserable for an interactive SSH session typed
+# on a phone in France.
+HETZNER_LOCATIONS=${DEVBOX_HETZNER_LOCATIONS:-fsn1 nbg1 hel1}
+SCALEWAY_ZONES=${DEVBOX_SCALEWAY_ZONES:-fr-par-1 fr-par-2 fr-par-3 nl-ams-1}
+# No default, and it is the only one of these four without one. A location is a preference
+# and a wrong guess costs latency; a PROJECT is an account, and a wrong guess sends the
+# apply into somebody else's. This file carried one until it was published — the author's,
+# which every reader would have inherited and none would have owned. gcp_token refuses
+# rather than guesses, and the refusal names the variable.
+GCP_PROJECT=${DEVBOX_GCP_PROJECT:-}
+GCP_REGIONS=${DEVBOX_GCP_REGIONS:-europe-west1 europe-west4 europe-west9 europe-north1}
+CACHE_DIR=${DEVBOX_CACHE_DIR:-$HOME/.cache/devbox}
+
+# Everything that mutates a file SHARED between machines runs under this. ~/.ssh/config is
+# read, filtered and moved back into place, so three concurrent `down` are three
+# read-modify-writes on one file and the last one wins — measured: three destroyed
+# machines, two blocks removed, one left behind pointing at an address that no longer
+# exists.
+#
+# mkdir because it is atomic on every filesystem that matters and macOS ships no flock.
+# Held only around the short mutations, never around a terraform apply.
+with_lock() {
+  local lock=$HOME/.ssh/.devbox-config.lock i=0 rc=0
+  until mkdir "$lock" 2>/dev/null; do
+    i=$((i + 1))
+    [ "$i" -gt 300 ] && die "could not take $lock after 15s — remove it if nothing is running"
+    sleep 0.05
+  done
+  "$@" || rc=$?
+  rmdir "$lock" 2>/dev/null || true
+  return $rc
+}
+
+# Per machine, so that three of them coexist in ~/.ssh/config instead of overwriting one
+# another. The name doubles as the Host alias: `ssh devbox-6c8q3`, `ssh session2`.
+begin_mark() { printf '# >>> devbox:%s >>>' "$1"; }
+end_mark()   { printf '# <<< devbox:%s <<<' "$1"; }
+
+# --- plumbing ----------------------------------------------------------------
+
+need() { command -v "$1" >/dev/null || die "$1 is required and not in PATH"; }
+
+# Called before every `shift 2`, because `shift 2` with one argument left returns 1 and
+# set -e takes the whole script down — silently, since nothing has been printed yet.
+# Measured: `devbox tunnel --port` left with code 1, an empty stdout and an empty stderr, and
+# so did `probe --cloud`, `orphans --cloud` and `up --min-cpu`. A flag typed without its
+# value is an ordinary mistake and deserves an ordinary sentence.
+takes_value() { [ $# -ge 2 ] || die "$1 needs a value after it"; }
+
+# 0 when a value, its trailing CR and LF aside, holds no line break: what curl_auth can send.
+# Callers that hide stderr, or that must never die, ask this first and say it themselves.
+single_line() {
+  local v=$1
+  while :; do case $v in *$'\n'|*$'\r') v=${v%?} ;; *) break ;; esac; done
+  case $v in *$'\n'*|*$'\r'*) return 1 ;; esac
+  return 0
+}
+
+# curl, with the credential header on stdin instead of on its command line.
+#
+# `curl -H "Authorization: Bearer $TOKEN"` put the token in curl's argv, and an argv is
+# public: `ps -ww` and /proc/<pid>/cmdline show it to every account on the host, and the
+# dashboard shares its host with other sites. Measured on 11/09 with the real curl held open
+# by a local socket that never answered: `ps -o args=` printed the whole header back. The
+# ENVIRONMENT is not public - /proc/<pid>/environ is 0400 to its owner - which is why the
+# tokens reach this file there and terraform reads them there; the leak was this last hop,
+# at every call that authenticates: Hetzner, Scaleway, GCP, GitHub and the dashboard.
+#
+# `-K -` reads curl's own configuration from stdin, and printf is a builtin, so the header
+# goes from this shell's memory into a pipe without an execve on the way. A pipe and never a
+# here-string: bash before 5.1 backs <<< with a temporary FILE, the reason seed pushes its
+# secrets through a pipe too. No caller uses stdin for anything else; the one request that
+# does, the GCP token exchange posting its body on @-, carries no credential header and does
+# not come through here.
+#
+# Quoted for curl's config syntax: `\` and `"` escaped, which is all its parser undoes between
+# quotes. A line break cannot be escaped into anything harmless - an LF ends the configuration
+# line, so the rest of the value would be read as curl options of its own, `url` or `output`,
+# and a CR would travel inside the header - so one is refused, naming the credential and never
+# its value. Trailing ones are dropped first, as $(cat file) already drops a token file's last
+# newline; `-H` itself sent a malformed request for those, measured with curl 8.7.1.
+#
+#   curl_auth <what, for the refusal> "<Header: value>" <curl arguments...>
+curl_auth() {
+  local what=$1 line=$2 bs='\' q='"'
+  shift 2
+  single_line "$line" || die "$what holds a line break, which no HTTP header can carry. Nothing was sent."
+  while :; do case $line in *$'\n'|*$'\r') line=${line%?} ;; *) break ;; esac; done
+  # Through variables, and quoted: the replacement half of ${//} has read backslashes and `&`
+  # differently across bash 3.2, 4 and 5.2, and a quoted replacement is literal in all three.
+  line=${line//"$bs"/"$bs$bs"}
+  line=${line//"$q"/"$bs$q"}
+  printf 'header = "%s"\n' "$line" | curl -K - "$@"
+}
+
+# 0.0256 -> "0,026". Display only: hourly_eur stays a plain number everywhere else.
+#
+# awk, and no longer bash's printf. The builtin parses its argument into a long double
+# wherever the platform has one: 80 bits on x86_64 Linux, where the dashboard runs, and a
+# plain double on arm64 macOS, where long double is the same type. The same price then
+# lands on either side of a tie depending on the machine — measured by the first CI run on
+# ubuntu, 11/09: 0.0005 gave 0,000 there and 0,001 on the Mac, and 36 of 601 values in the
+# eur.test.ts sweep disagreed. awk holds a double everywhere, as eur_month below always did
+# and as cli/src/format.ts does, so the three agree on every machine.
+eur() { awk -v v="$1" 'BEGIN { printf "%.3f", v }' | tr '.' ','; }
+
+# 365,25 × 24 ÷ 12, the average month. NOT 720: a flat thirty-day month is short seven
+# months out of twelve, and it is short precisely on the machines nobody remembered to
+# stop — the only ones for which a monthly figure is worth printing at all.
+MONTH_HOURS=730
+
+# 0.0312 -> "22,78". The hourly price carried over an average month, interpolated and not
+# read: `price_hourly` is the only price devbox asks any of the three providers for, and it is
+# the only one two of them publish. Naming the constant rather than writing 730 into the
+# arithmetic is what keeps this layer, the Ink layer and the dashboard from quietly
+# drifting into three different numbers for the same machine.
+#
+# The number reads HIGH and the `price:` block under `probe` says so out loud. Measured on
+# the Hetzner API on 25/08, location fsn1: cpx22 at 0,0312/h interpolates to 22,78 against
+# a published 19,49, cpx32 at 0,0569 to 41,54 against 35,49, cx23 at 0,0088 to 6,42
+# against 5,49 — around 17 % over, every time, because Hetzner stops counting hours past a
+# cap in the month and a straight multiplication does not. A column labelled "per month"
+# that overshoots the invoice by a sixth in silence is how a reader learns to distrust the
+# whole table, so the warning ships with the number.
+#
+# awk, and not printf, because that is the idiom the daily total in fleet_table has always
+# used: both then round half to even the way the C printf does, which is exactly what
+# cli/tests/eur.test.ts pins against the real bash.
+eur_month() { awk -v h="$1" -v m="$MONTH_HOURS" 'BEGIN { printf "%.2f", h * m }' | tr '.' ','; }
+
+# Every `terraform init` runs under this, and nothing else of Terraform does.
+#
+# The dashboard runs several jobs at once, and it points every one of them at ONE
+# TF_PLUGIN_CACHE_DIR, because a single initialised cloud weighed 65 MB per account.
+# Terraform's cache is not safe for two concurrent inits: two processes unpacking the same
+# provider into it corrupt each other (hashicorp/terraform#32028, #31964). The pull request
+# that would have locked it, #36085, was closed unmerged in April 2026, and the server runs
+# 1.15.9 — so the lock is ours to take. Without a cache the race is still there, one level
+# down: two inits in the same root write the same .terraform/ directory.
+#
+# Not with_lock, and not its path. That one guards ~/.ssh/config and lives under HOME, which
+# two accounts sharing a cache do not share. This one sits IN the cache, and at the top of
+# the roots when there is none, so it is exactly as global as the thing it protects. The
+# cache directory is created here: terraform refuses a TF_PLUGIN_CACHE_DIR that does not
+# exist, and a lock whose parent is missing would read as a lock held for ten minutes.
+#
+# Only the init. It takes seconds once the cache is warm; the apply after it takes minutes,
+# touches only its own workspace, and stays parallel.
+#
+# Ten minutes, where with_lock waits fifteen seconds. A cold init downloads every provider
+# of its root, a minute or more on a slow link, and the wait counts from each arrival: the
+# third job behind two cold inits waits for both. Ten minutes covers several of them in a
+# row; a lock held longer than that is a stale one, left by a process killed outright. The
+# trap covers the SIGTERM a restart sends — checked on bash 3.2, the EXIT trap still runs —
+# and nothing covers SIGKILL, hence a message that says where the lock is. No other trap
+# exists in this file; one added later has to be chained with this one, not replace it.
+#
+# Measured on 13/09 by cli/tests/core-init-lock.test.ts before this existed: two `up`
+# sharing a cache started their inits 0.3 s apart, each two seconds long.
+with_init_lock() {
+  local dir=${TF_PLUGIN_CACHE_DIR:-$TF_ROOT} i=0 rc=0
+  local lock=$dir/.devbox-init.lock
+  mkdir -p "$dir" || die "cannot create $dir, where the terraform init lock is taken"
+  until mkdir "$lock" 2>/dev/null; do
+    if [ "$i" = 0 ]; then log "another terraform init holds $lock, waiting for it" >&2; fi
+    i=$((i + 1))
+    [ "$i" -gt 1200 ] && die "could not take $lock after 10 minutes.
+  Another terraform init holds it, or one was killed holding it: remove it only if nothing
+  is running."
+    sleep 0.5
+  done
+  trap "rmdir $(printf '%q' "$lock") 2>/dev/null || true" EXIT
+  "$@" || rc=$?
+  rmdir "$lock" 2>/dev/null || true
+  trap - EXIT
+  return $rc
+}
+
+# One Terraform WORKSPACE per machine. That is the whole difference between "a second
+# machine" and "Terraform replacing the first": with a single state per root, a second
+# apply sees the same hcloud_server.devbox and moves it rather than adding one.
+tf() {
+  local cloud=$1 ws=$2; shift 2
+  # TF_WORKSPACE, never `workspace select`. The subcommand writes the choice into
+  # .terraform/environment, a file SHARED by everything running in that directory: two
+  # concurrent `devbox up` would race on which workspace is current, and the loser could
+  # apply one machine's plan into the other's state. Measured: the second one died on
+  # "Error acquiring the state lock" — the lock caught it that time, and the lock is not
+  # what protects the workspace choice.
+  #
+  # The variable overrides per invocation, creates the workspace on demand, and leaves the
+  # shared file untouched. State locks are then per workspace, so two names never contend.
+  TF_WORKSPACE=$ws terraform -chdir="$TF_ROOT/$cloud" "$@"
+}
+
+state_has_resources() {
+  [ -s "$1" ] || return 1
+  [ "$(jq '[.resources[]? | select(.mode=="managed")] | length' "$1" 2>/dev/null || echo 0)" -gt 0 ]
+}
+
+# Every live machine, as "<cloud> <name>" lines. Read from the state files directly rather
+# than through `terraform output`, which would need an init per directory just to answer
+# "is there anything here at all".
+instances() {
+  local c d ws
+  for c in $CLOUDS_IMPLEMENTED; do
+    state_has_resources "$TF_ROOT/$c/terraform.tfstate" && echo "$c default"
+    for d in "$TF_ROOT/$c"/terraform.tfstate.d/*/; do
+      [ -d "$d" ] || continue
+      ws=$(basename "$d")
+      state_has_resources "$d/terraform.tfstate" && echo "$c $ws"
+    done
+  done
+  return 0
+}
+
+# With no name and exactly one machine, act on that one: the single-machine case is the
+# common one and should not need ceremony. With several, refuse and list them rather than
+# guess — picking the wrong target for `down` is the one mistake here that destroys work.
+resolve() {
+  local want=${1:-} list hit
+  list=$(instances)
+  [ -n "$list" ] || die "no machine. devbox up"
+  if [ -n "$want" ]; then
+    hit=$(awk -v w="$want" '$2 == w { print; exit }' <<<"$list")
+    [ -n "$hit" ] || die "no machine named '$want'. devbox ls"
+    printf '%s' "$hit"; return 0
+  fi
+  [ "$(grep -c . <<<"$list")" = 1 ] && { printf '%s' "$list"; return 0; }
+  die "several machines exist, name the one you mean:
+$(sed 's/^/    /' <<<"$list")"
+}
+
+outputs() { tf "$1" "$2" output -json; }
+
+# The one machine meant, and which side is to act on it, as "<where> <name>" where where is
+# `remote` or `local` — the dashboard, or the Terraform state on this workstation.
+#
+# The question is only ever asked by the verbs that can be delegated, and it is asked once,
+# so that the refusal to guess between several machines reads the same on both sides.
+resolve_any() {
+  local want=${1:-} names
+  # Assigned first, never inlined, for the reason `detail_json` gives below: a `die` inside
+  # a substitution only kills that subshell, and the caller would carry on with an empty
+  # name.
+  if [ -z "$REMOTE" ]; then
+    local pick; pick=$(resolve "$want") || exit 1
+    printf 'local %s' "$(awk '{print $2}' <<<"$pick")"
+    return 0
+  fi
+
+  names=$(remote_api GET /api/machines | jq -r '.[].name') || exit 1
+  names=$(grep . <<<"$names" || true)
+  [ -n "$names" ] || die "no machine. devbox up"
+
+  if [ -n "$want" ]; then
+    grep -qx -- "$want" <<<"$names" || die "no machine named '$want'. devbox ls"
+    printf 'remote %s' "$want"; return 0
+  fi
+  [ "$(grep -c . <<<"$names")" = 1 ] && { printf 'remote %s' "$names"; return 0; }
+  die "several machines exist, name the one you mean:
+$(sed 's/^/    /' <<<"$names")"
+}
+
+# --- the dashboard, when this Mac delegates to it -----------------------------
+
+# Cached at 600 under ~/.config/devbox/secrets, like every other secret this tool holds, and
+# never on a command line.
+remote_token() {
+  local f=$SECRETS_DIR/remote
+  local v=${DEVBOX_REMOTE_TOKEN:-}
+  [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  # `cat` guarded, not assumed: a cached token at mode 000 printed `Permission denied` and
+  # then handed back an EMPTY string, which travelled as `Authorization: Bearer` and came
+  # back 401 — advice about rotating a token, for a file that simply could not be opened.
+  # Unreadable now falls through to the prompt, which is what an absent one already did.
+  if [ -s "$f" ] && v=$(cat "$f" 2>/dev/null) && [ -n "$v" ]; then printf '%s' "$v"; return 0; fi
+  install -d -m 700 "$SECRETS_DIR"
+  printf 'token for %s (not echoed): ' "$REMOTE" >&2
+  read -rs v; echo >&2
+  [ -n "$v" ] || die "empty, nothing sent"
+  (umask 077; printf '%s' "$v" >"$f")
+  printf '%s' "$v"
+}
+
+# One call to the dashboard. Dies on anything but 2xx, naming the status: a dashboard that
+# answers 502 must not look like a dashboard that answers an empty fleet.
+remote_api() {
+  local method=$1 path=$2 payload=${3:-} body code token
+  # Assigned first, never inlined into the array. The third time this file learns it: a
+  # `die` inside a substitution kills only that subshell, and `local` would swallow the
+  # status on top. Inline, remote_token's "empty, nothing sent" printed its red line and
+  # the request left anyway carrying `Authorization: Bearer` with nothing after it — which
+  # the dashboard answers 401, so the tool then advised rotating a token that never was.
+  token=$(remote_token) || exit 1
+  # Asked here and not left to curl_auth: its refusal would land in `body` through the 2>&1
+  # below, and the sentence printed would be "cannot reach", about a network that is fine.
+  single_line "$token" || die "the dashboard token holds a line break, which no HTTP header can carry. Nothing was sent.
+  Rewrite $SECRETS_DIR/remote, or DEVBOX_REMOTE_TOKEN, on one line."
+  local args=(-sS -X "$method")
+  [ -n "$payload" ] && args+=(-H 'Content-Type: application/json' -d "$payload")
+  body=$(curl_auth "the dashboard token" "Authorization: Bearer $token" \
+           "${args[@]}" -w '\n%{http_code}' "$REMOTE$path" 2>&1) || die "cannot reach $REMOTE
+  The dashboard is the only executor when DEVBOX_REMOTE is set, and there is no fallback to
+  the local state on purpose: it would rebuild the second fleet this exists to avoid.
+    DEVBOX_REMOTE= devbox ls    to read the local state, knowingly"
+  code=${body##*$'\n'}; body=${body%$'\n'*}
+  case "$code" in
+    2*) printf '%s' "$body" ;;
+    401|403) die "$REMOTE refused the token ($code). Create a new CLI token on the dashboard's /account page,
+  then remove $SECRETS_DIR/remote so it is asked for again." ;;
+    *) die "$REMOTE answered $code: $(jq -r '.error // .' <<<"$body" 2>/dev/null || printf '%s' "$body")" ;;
+  esac
+}
+
+# This file's own identity, as the dashboard computes it for its copy: the sha256 of the
+# bytes.
+#
+# sha256sum first, shasum second, and NOTHING third. cksum would be a CRC32 answering a
+# SHA-256 question: one side falling back to it would disagree with the other on every
+# single run and warn about a gap that does not exist, which destroys the mechanism faster
+# than not having it at all. Empty means "I could not look", which version_gate says out
+# loud rather than swallowing.
+#
+# `cut` and not `head`, which closes the pipe and sends the writer a SIGPIPE that
+# `set -o pipefail` turns into a dead script — the failure already measured in random_name.
+self_version() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$SELF" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$SELF" | cut -d' ' -f1
+  fi
+  return 0
+}
+
+# The deployment gap, said out loud before anything is ordered.
+#
+# A fix applied to this file changes nothing about what DEVBOX_REMOTE runs: the dashboard
+# executes engine/devbox, its own copy, renewed only by a deployment. That cost a morning of
+# correcting, re-running, and watching the same bug survive — so the tool now says it.
+#
+# Three answers and never two. Equal is silence; different is one warning naming both short
+# digests AND what closes the gap; "I could not look" says so in its own words, with an
+# opening deliberately unlike the other. A check that renders doubt as agreement is
+# the thing that lost the morning, so doubt is never silent — with two exceptions, and only
+# because remote_api dies two hundred milliseconds later with a better message than anything
+# guessable here: the dashboard is unreachable, or it refused the token. Neither of those
+# runs the command, so neither can be read as "all good". A flaky link that times out here
+# and answers there is the one hole left, and four seconds is exactly how wide it is.
+#
+# It never prompts. remote_token asks at the keyboard when nothing is cached, and the Ink
+# layer spawns this core with stdin closed: a prompt here would not ask, it would kill the
+# command on "empty, nothing sent" before it ever ran. The token is read, never requested,
+# and having none is a "could not look" like any other.
+#
+# Its own short leash, because remote_api has no --max-time at all — defensible for a job
+# that takes minutes, intolerable in front of every command.
+#
+# The remedy names no tool, because the deployment is not this repository's: whatever
+# deposited engine/devbox is what renews it. What it can name is the check that must pass
+# before, and it is one string so the three sentences that end on it cannot drift apart.
+version_gate() {
+  local ours token body code theirs rc=0
+  local fix='redeploy the dashboard (cd dashboard && bun run verify first)'
+  # Named rather than skipped. Without curl, remote_api dies on "cannot reach $REMOTE",
+  # which blames the network for a PATH; the gate gets there first and says which tool.
+  if ! command -v curl >/dev/null 2>&1; then
+    warn "cannot tell what $REMOTE runs: curl is not in PATH"
+    return 0
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    warn "cannot tell what $REMOTE runs: jq is not in PATH"
+    return 0
+  fi
+
+  ours=$(self_version)
+  if [ -z "$ours" ]; then
+    warn "cannot tell what $REMOTE runs: neither sha256sum nor shasum is in PATH"
+    return 0
+  fi
+
+  token=${DEVBOX_REMOTE_TOKEN:-}
+  # `|| token=''` and not a bare substitution: `[ -s ]` says the file exists and is not
+  # empty, never that it can be read. Bare, a token file at mode 000 — or a directory of
+  # that name — made `cat` fail, and set -e killed the script before the dispatch: no verb,
+  # no message of ours, just `cat: Permission denied`. A gate is not allowed to do that.
+  if [ -z "$token" ] && [ -s "$SECRETS_DIR/remote" ]; then
+    token=$(cat "$SECRETS_DIR/remote" 2>/dev/null) || token=''
+  fi
+  if [ -z "$token" ]; then
+    warn "cannot tell what $REMOTE runs: no dashboard token is cached here yet"
+    return 0
+  fi
+  # curl_auth would refuse it by dying, inside a substitution whose stderr is thrown away:
+  # the gate would go silent, which is agreement's sentence. Doubt says so instead, and
+  # remote_api refuses the same token a moment later, out loud.
+  if ! single_line "$token"; then
+    warn "cannot tell what $REMOTE runs: the dashboard token holds a line break"
+    return 0
+  fi
+
+  body=$(curl_auth "the dashboard token" "Authorization: Bearer $token" \
+              -sS --connect-timeout 2 --max-time 4 \
+              -w '\n%{http_code}' "$REMOTE/api/version" 2>/dev/null) || rc=$?
+  # The leash is this gate's alone: remote_api has no --max-time, so a link slow enough to
+  # blow four seconds here can still answer the real call a moment later. Silence would
+  # then be a genuine false "all good" — the exact failure this exists to remove — so a
+  # timeout speaks and only a refused connection stays quiet, because that one takes
+  # remote_api down with it two hundred milliseconds later.
+  if [ "$rc" -eq 28 ]; then
+    warn "cannot tell what $REMOTE runs: it did not answer /api/version within 4s"
+    return 0
+  fi
+  [ "$rc" -eq 0 ] || return 0
+  code=${body##*$'\n'}; body=${body%$'\n'*}
+  case "$code" in
+    2*) : ;;
+    401|403) return 0 ;;
+    # A route that does not exist can only belong to a build made before the route. That
+    # is a proof rather than an absence of information, and it is the one state the
+    # dashboard is guaranteed to be in the first time this runs.
+    404) warn "$REMOTE has no /api/version: it was deployed before this check existed, so it is not running this file — $fix"
+         return 0 ;;
+    *) warn "cannot tell what $REMOTE runs: it answered $code"
+       return 0 ;;
+  esac
+
+  # "the key is missing" and "the key is null" are two different sentences: the first is a
+  # 200 that never mentioned an engine — a proxy, a login page, a later rewrite — and the
+  # second is this dashboard saying it has none. Collapsing them with `// "none"` turned
+  # a body of {} into a firm claim about the server's engine, and advised a deployment
+  # that would not have changed it.
+  theirs=$(jq -r 'if type == "object" and has("core") then (.core // "null") else "absent" end' \
+              <<<"$body" 2>/dev/null) || theirs=''
+  if [ -z "$theirs" ] || [ "$theirs" = absent ]; then
+    warn "cannot tell what $REMOTE runs: /api/version answered something this file cannot read"
+    return 0
+  fi
+  if [ "$theirs" = null ]; then
+    warn "$REMOTE has no engine deployed, so nothing there can run a job — $fix"
+    return 0
+  fi
+  # A string the server chose ends up on a terminal, so nothing but hex ever reaches it.
+  theirs=$(printf '%s' "$theirs" | tr -cd '0-9a-f')
+  if [ "${#theirs}" -ne 64 ]; then
+    warn "cannot tell what $REMOTE runs: /api/version named a core this file cannot read"
+  elif [ "$theirs" != "$ours" ]; then
+    warn "$REMOTE runs core ${theirs:0:7}, this file is ${ours:0:7} — $fix"
+  fi
+  return 0
+}
+
+# Echoes a job's log until it ends, then leaves with the job's own verdict. The polling is
+# the browser's, by byte offset, so a dropped connection resumes rather than replays.
+remote_follow() {
+  local id=$1 offset=0 chunk state
+  while :; do
+    chunk=$(remote_api GET "/api/jobs/$id/log?offset=$offset")
+    printf '%s' "$(jq -r '.text' <<<"$chunk")"
+    offset=$(jq -r '.size' <<<"$chunk")
+    state=$(jq -r '.state' <<<"$chunk")
+    [ "$state" = running ] || break
+    sleep 2
+  done
+  case "$state" in
+    succeeded) return 0 ;;
+    interrupted) die "the dashboard restarted during this job. A machine may exist that no
+  state knows about: devbox orphans" ;;
+    *) die "the job failed ($state)" ;;
+  esac
+}
+
+# The output contract, and the only thing the rest of this script knows about a cloud.
+out() { jq -r --arg k "$2" '.[$k].value // empty' <<<"$1"; }
+
+# A profile is a shell script with a declarative header, the same shape devbox's own client
+# used on the kubevirt branch: comment lines the tool reads. Nothing generates them, and a
+# profile stays runnable by hand on the machine.
+#
+#   # devbox-repo:     https://github.com/…      the repository to clone, if any
+#   # devbox-secrets:  claude github             pushed into /run/secrets, tmpfs, 0400 dev
+#   # devbox-min-cpu:  4                         what to order, unless a flag overrides
+#   # devbox-min-ram:  8
+#   # devbox-min-disk: 80
+#   # devbox-port:     9010 5173                 what the app listens on, for the forwards: the
+#                                                first is the app, the others ride beside it
+#   # devbox-note:     alice@acme.test / …       printed by `devbox info`
+profile_path() {
+  local n=$1 d
+  # Before the name check, whose message would read "must be letters ...: ''" to someone who
+  # simply named none.
+  [ -n "$n" ] || die "no profile named: pass --profile <name>, or set DEVBOX_PROFILE. devbox profiles lists them"
+  case "$n" in
+    */*|*[!a-zA-Z0-9_-]*) die "a profile name must be letters, digits, dash or underscore: '$n'" ;;
+  esac
+  local f
+  for d in $PROFILE_DIRS; do
+    f=$d/$n.sh
+    [ -f "$f" ] || continue
+    # A key given twice would silently lose all but the first: profile_meta stops at the
+    # first match. Refusing is the only honest option — a header that quietly ignores half
+    # of what it was told is worse than one that does not support repetition at all.
+    # Several repositories is not what a second devbox-repo line means anyway: a repository
+    # travels with ITS secret and ITS host, which only `clone_repo <secret> <url>` can say.
+    local dup
+    dup=$(awk '$1 == "#" && $2 ~ /^devbox-[a-z-]+:$/ { print $2 }' "$f" | sort | uniq -d)
+    [ -z "$dup" ] || die "$f declares $(tr '\n' ' ' <<<"$dup")more than once.
+  Only the first would be read. For several repositories, call clone_repo once per
+  repository instead — each with the secret and the host it needs."
+    printf '%s' "$f"; return 0
+  done
+  die "no profile named '$n'. devbox profiles"
+}
+
+profile_meta() {
+  awk -v k="devbox-$2:" '$1 == "#" && $2 == k { $1 = ""; $2 = ""; sub(/^[ \t]+/, ""); print; exit }' "$1"
+}
+
+# One profile, as an object: the whole declarative header, by the names the header uses.
+#
+# The table above cannot carry the note or the port, and the dashboard needs both to
+# pre-fill its form from the profile rather than from constants of its own. Same argument
+# as `ls --json`: a consumer must not parse something aligned for a terminal.
+profile_json() {
+  local f=$1 n=$2 v
+  jq -n \
+    --arg name "$n" \
+    --arg path "$f" \
+    --arg repo "$(profile_meta "$f" repo)" \
+    --arg secrets "$(profile_meta "$f" secrets)" \
+    --arg note "$(profile_meta "$f" note)" \
+    --arg cpu "$(profile_meta "$f" min-cpu)" \
+    --arg ram "$(profile_meta "$f" min-ram)" \
+    --arg disk "$(profile_meta "$f" min-disk)" \
+    --arg port "$(profile_meta "$f" port)" \
+    '
+    def blank: if . == "" then null else . end;
+    # `try`, because a header is written by hand and `# devbox-min-cpu: plenty` is a typo, not
+    # a reason to vanish. Bare `tonumber` killed this jq, profiles_json never looked at its
+    # status, and `jq -s` simply received one object fewer: `devbox profiles --json` answered a
+    # clean listing with a row missing and exited 0, then `devbox up --profile broken` said "no
+    # profile named 'broken'" about a file sitting right there. Null is what an absent field
+    # already gets, and the field is named on stderr rather than passed over.
+    def digits: test("^[0-9]+$");
+    # One predicate, shared with `unreadable` below. Two different ones — `try tonumber`
+    # here and a regex there — left a gap where -4, 2.5 and 1e3 were BOTH announced as
+    # unreadable AND kept: the message sent the reader looking for a null that was not
+    # there, while the value went on to the provider. Warned if and only if null.
+    def num: if . == "" then null else (if digits then tonumber else null end) end;
+    # The ports are a LIST since 24/09 - `9010 5173`, the app first - and readable only whole:
+    # each word a port between 1 and 65535, the same rule as port_list below. A list read in
+    # half would forward some ports and drop the others without a word.
+    def words: split(" ") | map(select(. != ""));
+    def aport: digits and (length <= 5) and (tonumber >= 1) and (tonumber <= 65535);
+    def portsok: words | all(aport);
+    def ports: if . == "" or (portsok | not) then []
+               else words | map(tonumber)
+                    | reduce .[] as $p ([]; if any(.[]; . == $p) then . else . + [$p] end) end;
+    def unreadable: [ ["min-cpu", $cpu], ["min-ram", $ram], ["min-disk", $disk] ]
+                    | map(select(.[1] != "" and (.[1] | digits | not)) | .[0])
+                    | . + (if $port != "" and ($port | portsok | not) then ["port"] else [] end);
+    { name: $name, path: $path,
+      # Stripped by profiles_json once it has been said out loud. It never reaches a
+      # consumer, so --json stays exactly the array it has always been.
+      unreadable: unreadable,
+      repo: ($repo | blank),
+      # A list, because that is what it is: the seed loop iterates over it, and a consumer
+      # that had to split a string would have to guess the separator.
+      secrets: ($secrets | if . == "" then [] else split(" ") end),
+      note: ($note | blank),
+      min_cpu: ($cpu | num), min_ram: ($ram | num), min_disk: ($disk | num),
+      # `port` stays the first, for every consumer written before the list: the app.
+      port: ($port | ports | .[0]), ports: ($port | ports) }'
+}
+
+profiles_json() {
+  [ -n "$REMOTE" ] && { remote_api GET /api/profiles; return 0; }
+  local d f n seen='' tmp
+  tmp=$(mktemp)
+  { for d in $PROFILE_DIRS; do
+      [ -d "$d" ] || continue
+      for f in "$d"/*.sh; do
+        [ -f "$f" ] || continue
+        n=$(basename "$f" .sh)
+        # First one wins, exactly as it does for profile_path: a personal profile shadows
+        # the repository's.
+        case " $seen " in *" $n "*) continue ;; esac
+        seen="$seen $n"
+        profile_json "$f" "$n"
+      done
+    done; } | jq -s '.' > "$tmp"
+
+  # Said before the array is handed over, and to stderr, so `--json` is untouched: the
+  # dashboard consumes this and must keep receiving a plain array.
+  jq -r '.[] | select((.unreadable | length) > 0) | "\(.name): \(.unreadable | join(", "))"' \
+     "$tmp" \
+    | while IFS= read -r line; do warn "profile $line — not a number, read as absent"; done
+  jq 'map(del(.unreadable))' "$tmp"
+  rm -f "$tmp"
+}
+
+profiles_table() {
+  local n s t r fmt
+  # The two variable columns are sized to what is in them, floored at the widths this table
+  # was written with so the shipped profiles keep the shape they have always had. Fixed at
+  # 11 and 16, a thirteen-character name and a two-word secret list each overflowed their
+  # column and
+  # pushed everything after them out of line — a table that only lines up for the profiles
+  # that came with the repository stops lining up the first time someone adds one, which is
+  # the one thing this listing exists to invite.
+  fmt="  %-$(jq -r '[ .[].name | length ] + [11] | max' <<<"$1")s"
+  fmt="$fmt %-$(jq -r '[ .[].secrets | join(" ") | length ] + [16] | max' <<<"$1")s %-9s %s\n"
+  printf "$fmt" PROFILE SECRETS TEMPLATE REPOSITORY
+  while IFS=$'\t' read -r n s t r; do
+    printf "$fmt" "$n" "$s" "$t" "$r"
+  done < <(jq -r '.[] | [ .name, (.secrets | join(" ")),
+                          ((.min_cpu // "?" | tostring) + "c/" + (.min_ram // "?" | tostring) + "G"),
+                          (.repo // "—") ] | @tsv' <<<"$1")
+}
+
+cmd_profiles() {
+  need jq
+  local json=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --json) json=1; shift ;;
+      *) die "unknown flag for profiles: $1" ;;
+    esac
+  done
+
+  local rows; rows=$(profiles_json) || exit 1
+  [ "$json" = 1 ] && { printf '%s\n' "$rows"; return 0; }
+  profiles_table "$rows"
+  echo
+  if [ -n "$REMOTE" ]; then
+    # Saying "yours go in ~/.config/devbox/profiles" here would be wrong: these came from the
+    # dashboard, and a profile added on this Mac would change nothing about them.
+    echo "  These are the dashboard's, at $REMOTE. A profile added here changes nothing"
+    echo "  for them: ship it with the dashboard, or add it to its own profiles directory."
+  else
+    echo "  Yours go in $CONFIG_DIR/profiles/ and shadow the repository's."
+    echo "  The shortest, $HERE/profiles/claude.sh, is the one to copy: add a devbox-repo line."
+  fi
+}
+
+# Five characters from /dev/urandom, lowercase alphanumeric: enough that two machines a
+# day never meet, short enough to type on a phone.
+#
+# Byte by byte rather than `tr -dc a-z0-9 </dev/urandom | head -c 5`, which was the first
+# version and which dies. head closes the pipe after its five bytes, tr takes SIGPIPE, and
+# `set -o pipefail` turns that into a failed pipeline that `set -e` kills the script on.
+# It is a race, so it survived every run where the caller passed --name, which the
+# dashboard always does: only a bare `devbox up` could hit it.
+random_name() {
+  local chars=abcdefghijklmnopqrstuvwxyz0123456789 out='' b
+  for b in $(head -c 5 /dev/urandom | od -An -tu1); do
+    out=$out${chars:$((b % 36)):1}
+  done
+  printf 'devbox-%s' "$out"
+}
+
+ensure_key() {
+  # Generating is right on a workstation and wrong everywhere else. A machine created with
+  # a freshly minted key is one that neither Termius nor the other machine can join, and
+  # the failure only shows at the first connection attempt, minutes later, as a refused
+  # public key. DEVBOX_KEY_REQUIRED is what the dashboard sets: there the key is deposited
+  # from the vault, and a missing one means the deployment is incomplete, not that a new
+  # pair is wanted.
+  if [ -n "${DEVBOX_KEY_REQUIRED:-}" ]; then
+    [ -f "$KEY" ] || die "$KEY is missing, and DEVBOX_KEY_REQUIRED forbids minting one.
+  Deposit the key and its .pub, or clear DEVBOX_KEY_REQUIRED to generate a new pair."
+    [ -f "$KEY.pub" ] || die "$KEY.pub is missing. Both apply and destroy pass it as
+  -var ssh_public_key, so a destroy would fail with the machine still on the meter."
+    return 0
+  fi
+  [ -f "$KEY" ] && return 0
+  [ -d "$(dirname "$KEY")" ] || install -d -m 700 "$(dirname "$KEY")"
+  log "generating $KEY"
+  ssh-keygen -t ed25519 -N '' -C devbox -f "$KEY"
+}
+
+ssh_to() {
+  local ip=$1 user=$2 port=$3; shift 3
+  ssh -i "$KEY" -p "$port" \
+      -o StrictHostKeyChecking=accept-new \
+      -o ServerAliveInterval=30 -o ServerAliveCountMax=6 \
+      "$user@$ip" "$@"
+}
+
+wait_ssh() {
+  local ip=$1 port=$2 i
+  log "waiting for sshd on $ip:$port"
+  for i in $(seq 60); do
+    nc -z -w 5 "$ip" "$port" 2>/dev/null && { echo "   open after $((i*5))s at most"; return 0; }
+    sleep 5
+  done
+  die "$ip never opened port $port"
+}
+
+# The IP changes with every machine, so without this the next connection opens on a
+# changed-identity warning and Termius refuses it outright.
+refresh_known_hosts() {
+  local ip=$1 port=$2
+  local target=$ip
+  [ "$port" = 22 ] || target="[$ip]:$port"
+  touch "$KNOWN_HOSTS"
+  # -f is not a detail: ssh-keygen -R IGNORES HOME and finds the file through getpwuid, so
+  # without it the removal edits the running account's known_hosts while the keyscan below
+  # appends to ours. The dashboard runs with its own HOME, so its file was never purged and
+  # grew a line per machine; an address released and re-rented by the provider showed up
+  # twice, the reader took the first one, a dead machine's key, and refused the live one.
+  ssh-keygen -f "$KNOWN_HOSTS" -R "$target" >/dev/null 2>&1 || true
+  ssh-keyscan -T 10 -p "$port" -t ed25519 "$ip" 2>/dev/null >>"$KNOWN_HOSTS" || true
+}
+
+host_fingerprint() {
+  local ip=$1 port=$2
+  ssh-keyscan -T 10 -p "$port" -t ed25519 "$ip" 2>/dev/null \
+    | ssh-keygen -lf - 2>/dev/null | awk '{print $2}' | head -1
+}
+
+# For the Mac's own `ssh <name>`, and nothing more: the phone runs Termius without a
+# desktop or cloud sync, so ~/.ssh/config never reaches it and `info` prints fields to
+# type instead. Delimited by markers and rewritten whole, never appended to: a stale
+# second block for the same name silently wins or loses depending on which one ssh reads
+# first, and the address it holds belongs to a machine that no longer exists.
+# The app listens on 9010 inside EVERY machine, so three machines all want local 9010 and
+# only the first forward can bind it. Each therefore gets its own local port, allocated
+# when it is created and written into the Host block that uses it: the config file is both
+# the answer and the registry, so there is no second place to keep in sync.
+#
+# The offset carries to the cluster port too — machine n is 9010+n and 16443+n — so one
+# number identifies a machine everywhere. 16443 rather than 6443 for the reason the
+# Makefile already gives: a workstation running Docker Desktop's Kubernetes listens on
+# 6443, and kubectl would quietly talk to that instead.
+next_local_port() {
+  local cfg=$1 used p
+  used=$(awk '$1 == "LocalForward" { print $2 }' "$cfg" 2>/dev/null)
+  for p in $(seq 9010 9060); do
+    grep -qx "$p" <<<"$used" && continue
+    lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && continue
+    printf '%s' "$p"; return 0
+  done
+  die "no free local port between 9010 and 9060"
+}
+
+# A local port for an extra forward: the one asked for when neither the config nor a
+# listener holds it, else the first free one from 20000. The third argument lists what this
+# very block has already taken, which the config does not hold yet.
+extra_local_port() {
+  local cfg=$1 want=$2 taken=$3 used p
+  used=$(awk '$1 == "LocalForward" { print $2 }' "$cfg" 2>/dev/null)
+  for p in "$want" $(seq 20000 20200); do
+    [ "$p" -le 65535 ] || continue
+    grep -qx "$p" <<<"$used" && continue
+    case " $taken " in *" $p "*) continue ;; esac
+    lsof -nP -iTCP:"$p" -sTCP:LISTEN >/dev/null 2>&1 && continue
+    printf '%s' "$p"; return 0
+  done
+  die "no free local port for an extra forward"
+}
+
+# Reads back what was allocated, so info and the Termius block never disagree with what
+# ssh will actually do.
+# Both of these read a file that may simply not be there yet, and both are called as bare
+# assignments — `recorded=$(profile_of "$name")` — where set -e is fully armed.
+#
+# `2>/dev/null` hid awk's complaint but not its status: on a workstation that has never run
+# `devbox up`, awk exits 2 on the missing ~/.ssh/config, `set -o pipefail` carries that out of
+# the pipeline, the assignment inherits it, and the script died there. Measured: `devbox seed`
+# on a fresh Mac left with code 2, an empty stdout and an empty stderr — no verb, no
+# message, nothing to act on. It happened before profile_path, so none of the careful
+# profile errors could ever be reached in that state.
+#
+# The guard is the file test, and `cut` rather than `head`, which closes the pipe and sends
+# awk a SIGPIPE that pipefail turns back into the same death. Absent means empty, which is
+# what every caller already treats as "this machine has no block here".
+local_port() {
+  local name=$1 b e
+  [ -f "$SSH_CONFIG" ] || return 0
+  b=$(begin_mark "$name"); e=$(end_mark "$name")
+  awk -v b="$b" -v e="$e" '
+    $0 == b { inside = 1 } inside && $1 == "LocalForward" { print $2; exit } $0 == e { inside = 0 }' \
+    "$SSH_CONFIG" 2>/dev/null | cut -d' ' -f1
+}
+
+profile_of() {
+  local name=$1 b e
+  [ -f "$SSH_CONFIG" ] || return 0
+  b=$(begin_mark "$name"); e=$(end_mark "$name")
+  awk -v b="$b" -v e="$e" '
+    $0 == b { inside = 1 } inside && $2 == "devbox-profile" { print $3; exit } $0 == e { inside = 0 }' \
+    "$SSH_CONFIG" 2>/dev/null | cut -d' ' -f1
+}
+
+# The ports of a `devbox-port:` value, space-separated, the app first, each once. Returns 1
+# and prints nothing on anything that is not a list of ports between 1 and 65535, because
+# every one of them becomes a LocalForward line and ssh refuses the ENTIRE config on a bad
+# one - every host in it, not only this machine's. `read -a` and not `for p in $1`, which
+# would glob a `*`. Leading zeros normalised: 08080 is 8080 to ssh as well.
+port_list() {
+  local words p n out=''
+  read -r -a words <<<"${1:-}" || true
+  for p in ${words[@]+"${words[@]}"}; do
+    case "$p" in *[!0-9]*) return 1 ;; esac
+    [ "${#p}" -le 5 ] || return 1
+    n=$((10#$p))
+    [ "$n" -ge 1 ] && [ "$n" -le 65535 ] || return 1
+    case " $out " in *" $n "*) continue ;; esac
+    out="${out:+$out }$n"
+  done
+  printf '%s' "$out"
+}
+
+# What the app listens on INSIDE the machine, read from the profile that provisioned it:
+# every port it declares, the app first. Not a constant: a profile is free to serve on any
+# port, and a forward aimed at 9010 would then reach nothing. Falls back rather than dies,
+# because it is called to DESCRIBE a machine — one provisioned by a profile since renamed
+# must still print its address.
+app_ports_of() {
+  local prof=${1:-} pf p
+  [ -n "$prof" ] || { printf '9010'; return 0; }
+  pf=$(profile_path "$prof" 2>/dev/null) || { printf '9010'; return 0; }
+  p=$(port_list "$(profile_meta "$pf" port)") || p=''
+  printf '%s' "${p:-9010}"
+}
+
+app_port_of() {
+  local ports; ports=$(app_ports_of "${1:-}")
+  printf '%s' "${ports%% *}"
+}
+
+# The forwards this machine's Host block holds, `local remote` per line, the app first -
+# without the cluster's, which is not the app's and has its own field (kube_port). Read back
+# rather than recomputed, so info and the Termius card never disagree with what ssh will
+# actually do. Told apart by its local port, 16443 plus the app's offset, which is how
+# write_ssh_config allocates it.
+forwards_of() {
+  local name=$1 b e
+  [ -f "$SSH_CONFIG" ] || return 0
+  b=$(begin_mark "$name"); e=$(end_mark "$name")
+  awk -v b="$b" -v e="$e" '
+    $0 == b { inside = 1; next }
+    $0 == e { inside = 0 }
+    inside && $1 == "LocalForward" {
+      n = split($3, dest, ":")
+      if (first == "") { first = $2; kube = 16443 + $2 - 9010 }
+      if ($2 == kube) next
+      print $2, dest[n]
+    }' "$SSH_CONFIG" 2>/dev/null
+}
+
+# One machine, as an object. The same seven outputs the rest of the script reads, plus the
+# three facts that live in ~/.ssh/config rather than in Terraform: the profile it was
+# provisioned with, the local port allocated to it, and the port to aim that forward at.
+#
+# This exists for the same reason `probe --json` does: the dashboard is a second consumer,
+# and a consumer must not have to parse a table that was formatted for a terminal.
+machine_json() {
+  local cloud=$1 name=$2 o
+  o=$(outputs "$cloud" "$name" 2>/dev/null) || return 1
+  local prof app hourly port
+  prof=$(profile_of "$name")
+  app=$(local_port "$name"); app=${app:-9010}
+  # Defaulted before reaching --argjson, which refuses an empty string outright: a state
+  # missing an output should degrade to null, not abort the whole listing.
+  hourly=$(out "$o" hourly_eur); hourly=${hourly:-null}
+  port=$(out "$o" port); port=${port:-null}
+  jq -n \
+    --arg name "$name" \
+    --arg cloud "$(out "$o" cloud)" \
+    --arg region "$(out "$o" region)" \
+    --arg type "$(out "$o" instance_type)" \
+    --arg profile "$prof" \
+    --arg ip "$(out "$o" ip)" \
+    --arg user "$(out "$o" user)" \
+    --argjson hourly_eur "$hourly" \
+    --argjson port "$port" \
+    --argjson local_port "$app" \
+    --arg app_ports "$(app_ports_of "$prof")" \
+    --arg forwards "$(forwards_of "$name")" \
+    '($app_ports | split(" ") | map(tonumber)) as $ports
+     | { name: $name, cloud: $cloud, region: $region, instance_type: $type,
+       profile: (if $profile == "" then null else $profile end),
+       hourly_eur: $hourly_eur, ip: $ip, user: $user, port: $port,
+       local_port: $local_port, app_port: $ports[0],
+       # Every port the profile forwards, the app first: what `devbox sync` makes tunnels for
+       # on a workstation, which allocates its own local ports.
+       app_ports: $ports,
+       # And what THIS config holds for them, as ssh will do it. Fewer than app_ports on a
+       # block written before the list, until `devbox sync` rewrites it.
+       forwards: ($forwards | split("\n") | map(select(. != "") | split(" ")
+                  | { local: (.[0] | tonumber), remote: (.[1] | tonumber) })) }'
+}
+
+# The fifth argument is every port the profile forwards, space-separated, the app first. The
+# app keeps the local port it always had, 9010 plus the machine's offset, and the cluster
+# follows it at 16443 plus the same offset. The others ride beside them: the app's local
+# port plus 1000 per rank - 10011, 11011 for the machine on 9011, so the offset still names
+# the machine - or, when that one is taken, the first free port from 20000.
+write_ssh_config() {
+  local ip=$1 user=$2 port=$3 name=$4 appports=${5:-9010} prof=${6:-} tmp b e app kube
+  local appport extras='' extra rank=0 local_extra forwards=''
+  # Printed and returned, never died: with_lock runs this and removes its lock only when it
+  # returns, so a die here would leave ~/.ssh/config locked for every later command.
+  appports=$(port_list "$appports") || {
+    printf '\033[1;31mx\033[0m %s\n' "not a list of ports between 1 and 65535: '$5'" >&2
+    return 1
+  }
+  [ -n "$appports" ] || appports=9010
+  appport=${appports%% *}
+  b=$(begin_mark "$name"); e=$(end_mark "$name")
+  touch "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+  tmp=$(mktemp)
+  # Own block stripped first, so re-running `up` on the same name reclaims its own port
+  # instead of drifting one higher every time.
+  awk -v b="$b" -v e="$e" '
+    $0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }' "$SSH_CONFIG" >"$tmp"
+  # `|| return 1`, because the die inside next_local_port cannot stop anything on its own.
+  # Two layers swallow it: this is a substitution, so `exit 1` kills only its subshell, and
+  # with_lock invokes its argument as `"$@" || rc=$?`, which disarms set -e for the whole
+  # call. Measured with the window full: the port came back EMPTY, the block was written
+  # with `LocalForward  127.0.0.1:9010` and no local port at all — which makes ssh refuse
+  # the entire file, every host in it — and the command still printed
+  # "1 block(s) written" and left with 0. Fourth site of this trap in this file; the other
+  # three carry the same comment.
+  app=$(next_local_port "$tmp") || { rm -f "$tmp"; return 1; }
+  [ -n "$app" ] || { rm -f "$tmp"; return 1; }
+  kube=$(( 16443 + app - 9010 ))
+  # The same trap as above, once per extra port: each allocation is assigned and checked.
+  for extra in ${appports#"$appport"}; do
+    rank=$((rank + 1))
+    local_extra=$(extra_local_port "$tmp" $((app + 1000 * rank)) "$app $kube $extras") \
+      || { rm -f "$tmp"; return 1; }
+    [ -n "$local_extra" ] || { rm -f "$tmp"; return 1; }
+    extras="${extras:+$extras }$local_extra"
+    forwards="$forwards$local_extra $extra
+"
+  done
+  {
+    printf '%s\n' "$b"
+    printf 'Host %s\n' "$name"
+    printf '  HostName %s\n' "$ip"
+    printf '  User %s\n' "$user"
+    printf '  Port %s\n' "$port"
+    # Not "${KEY/#$HOME/~}": bash 5 tilde-expands the replacement of a pattern substitution
+    # and bash 3.2 does not, so the ~ written on the Mac came back as the full path on
+    # Linux. A ~ inside double quotes is never expanded, by any bash.
+    case $KEY in
+      "$HOME"/*) printf '  IdentityFile ~%s\n' "${KEY#"$HOME"}" ;;
+      *)         printf '  IdentityFile %s\n' "$KEY" ;;
+    esac
+    printf '  IdentitiesOnly yes\n'
+    printf '  StrictHostKeyChecking accept-new\n'
+    # Measured over a link with next to no latency: 0.26 ms of network round-trip and
+    # 24 ms of echo. The difference is not the link, it is OpenSSH 9.5's keystroke-timing
+    # obfuscation, on by default, which holds every keypress until the next tick of a fixed
+    # 20 ms grid before putting it on the wire. It defends against inferring a typed
+    # password from packet timings — and it does it by making the delay of a keystroke
+    # depend on nothing at all, which is exactly the jitter a hand feels as a dropped
+    # letter. Same session, obfuscation off: 0.46 ms median. On Scaleway, where the link
+    # itself costs 8 ms, it is the tail that moves — p90 28 ms down to 10 ms.
+    #
+    # Off here rather than in `Host *`, because this file belongs to whoever owns the Mac
+    # and devbox only ever writes between its own markers. `interval:10` would halve the cost
+    # and keep some of the defence; it is a knob for a machine that holds something worth
+    # typing a password into, and none of these do — they are reached by key, and the
+    # secrets arrive at seed over the channel, never at a prompt.
+    #
+    # IgnoreUnknown first, and it is not decoration: ssh refuses the ENTIRE file on a
+    # keyword it does not know — every host in it, not just this block — and the option is
+    # 9.5 and later. Guarded, an older ssh skips the line instead of locking its owner out
+    # of every machine they have. IgnoreUnknown itself is 6.3, older than anything that
+    # could read this.
+    printf '  IgnoreUnknown ObscureKeystrokeTiming\n'
+    printf '  ObscureKeystrokeTiming no\n'
+    printf '  LocalForward %s 127.0.0.1:%s\n' "$app" "$appport"
+    printf '  LocalForward %s 127.0.0.1:6443\n' "$kube"
+    # After the cluster's, so every reader that takes the FIRST forward for the app - local_port,
+    # `devbox ssh`, the TUI's open-in-browser - still does.
+    printf '%s' "$forwards" | while read -r l r; do
+      [ -n "$l" ] && printf '  LocalForward %s 127.0.0.1:%s\n' "$l" "$r"
+    done
+    # ssh ignores comments, and this block is already the registry for the local port —
+    # so it is also where the profile is recorded. A later `devbox seed` with no --profile
+    # then re-provisions with the same one instead of falling back to DEVBOX_PROFILE. No line
+    # at all when neither names one: an empty name recorded would be read back as a profile.
+    [ -z "${prof:-$PROFILE}" ] || printf '  # devbox-profile %s\n' "${prof:-$PROFILE}"
+    printf '%s\n' "$e"
+  } >>"$tmp"
+  mv "$tmp" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+}
+
+drop_ssh_config() {
+  local name=$1 tmp b e
+  [ -f "$SSH_CONFIG" ] || return 0
+  b=$(begin_mark "$name"); e=$(end_mark "$name")
+  tmp=$(mktemp)
+  awk -v b="$b" -v e="$e" '
+    $0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }' "$SSH_CONFIG" >"$tmp"
+  mv "$tmp" "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"
+}
+
+# --- hetzner -----------------------------------------------------------------
+
+hcloud_token() {
+  [ -n "${HCLOUD_TOKEN:-}" ] && return 0
+  # Its own file, sourced by nothing else. A Read & Write token is worth every server in
+  # its project, and it belongs in a dedicated project so that a leak cannot reach the
+  # one serving your production.
+  local f=$CONFIG_DIR/.env.tf
+  [ -f "$f" ] || die "no HCLOUD_TOKEN, and no $f.
+  Create a DEDICATED Hetzner project, mint a Read & Write token in it, then:
+    install -d -m 700 $CONFIG_DIR
+    printf 'HCLOUD_TOKEN=%s\\n' '<token>' > $f && chmod 600 $f"
+  set -a; . "$f"; set +a
+  [ -n "${HCLOUD_TOKEN:-}" ] || die "$f holds no HCLOUD_TOKEN"
+  export HCLOUD_TOKEN
+}
+
+hz_api() {
+  local body code
+  body=$(curl_auth HCLOUD_TOKEN "Authorization: Bearer $HCLOUD_TOKEN" -sS -w '\n%{http_code}' \
+         "https://api.hetzner.cloud/v1/$1")
+  code=${body##*$'\n'}; body=${body%$'\n'*}
+  [ "$code" = 200 ] || die "Hetzner API /v1/$1 answered $code: $(jq -r '.error.message // .' <<<"$body" 2>/dev/null)"
+  printf '%s' "$body"
+}
+
+# The same call, with the pages walked to the end.
+#
+# Hetzner answers 25 items when nothing asks otherwise, and says so quietly in
+# meta.pagination. `orphans` used the unpaginated form, so a project holding more than 25
+# servers had the surplus reported as "no orphan" — on the one command whose entire job is
+# to find machines that bill with nothing recording them. A safety net that stops at 25 is
+# worse than none, because it answers.
+#
+# Merged on the collection's own key, whatever it is called, so this works for servers as
+# well as for anything else paginated the same way.
+#
+# The accumulator below goes through --argjson, which is the shape that broke table_json
+# and gcp_candidates on Linux — one argument is capped at 128 KB there, and nowhere else.
+# Left alone here because it was MEASURED rather than assumed, on 31/08: Hetzner publishes
+# 25 server types, 46 KB accumulated, and Scaleway 38 KB per zone. Hetzner would have to
+# nearly triple its catalogue before this needs the same treatment, and rewriting a path
+# that works in production on a hunch is its own risk. The number is written down so the
+# next reader has a measurement instead of a worry.
+hz_all() {
+  local path=$1 key=$2 page=1 body all='[]'
+  while :; do
+    case $path in *\?*) body=$(hz_api "$path&per_page=50&page=$page") ;;
+                  *)     body=$(hz_api "$path?per_page=50&page=$page") ;; esac
+    all=$(jq -c --argjson acc "$all" --arg k "$key" '$acc + .[$k]' <<<"$body")
+    page=$(jq -r '.meta.pagination.next_page // empty' <<<"$body")
+    [ -n "$page" ] || break
+  done
+  jq -nc --argjson v "$all" --arg k "$key" '{ ($k): $v }'
+}
+
+# What is creatable right now, cheapest first, as TSV:
+#   hourly  type  location  cores  memory  disk  cpu_type
+#
+# Two signals, intersected, and the narrower one wins.
+#
+# server_types[].locations[].available is the one that survives: Hetzner is collapsing
+# datacenters into locations (changelog 2026-07-01) and the provider already marks
+# hcloud_server.datacenter deprecated. But the older datacenters.server_types.available
+# is STRICTER today, and measured rather than assumed: on 2026-08-19 the location flag
+# said cpx42 was creatable in fsn1 while fsn1-dc14 — the only datacenter in fsn1, so this
+# is not an aggregation artefact — did not list it. They agree everywhere else, including
+# on cx43, which both restrict to hel1.
+#
+# So the datacenter route narrows the location list while it still answers, and the code
+# degrades to locations alone the day it 404s. Ordering from a signal that is optimistic
+# by one location costs a failed apply and a retry; being strict costs nothing.
+#
+# It is worth having because it moves: on 2026-08-15 cx43 was creatable in Nuremberg AND
+# Helsinki, and four days later, Helsinki only. Falkenstein has been unable to create any
+# x86 machine of 8 vCPU or more throughout — and fsn1 is exactly the location a production
+# Terraform module pins and forgets. A machine that copied that constant would fail today
+# on a healthy account.
+#
+# The primary IPv4 is added into the price. Hetzner bills it separately (0.0008 EUR/h),
+# and a machine with no public address is one nobody can SSH into, so leaving it out
+# of hourly_eur would make the number a lie rather than an estimate.
+hz_candidates() {
+  local st pricing dc loc_filter
+  st=$(hz_api 'server_types?per_page=100')
+  pricing=$(hz_api 'pricing')
+  # Soft, not hz_api: this route is scheduled for removal, and its disappearance must
+  # widen the search rather than break the command.
+  dc=$(curl_auth HCLOUD_TOKEN "Authorization: Bearer $HCLOUD_TOKEN" -sS \
+         'https://api.hetzner.cloud/v1/datacenters?per_page=50' 2>/dev/null \
+       | jq -c 'if .datacenters then . else {datacenters: []} end' 2>/dev/null) || dc=''
+  [ -n "$dc" ] || dc='{"datacenters":[]}'
+  loc_filter=$(printf '%s\n' $HETZNER_LOCATIONS | jq -R . | jq -sc .)
+
+  jq -rn \
+    --argjson st "$st" --argjson pricing "$pricing" --argjson dc "$dc" --argjson locs "$loc_filter" \
+    --argjson cores "$MIN_CORES" --argjson mem "$MIN_MEMORY_GB" --argjson disk "$MIN_DISK_GB" '
+    ( $pricing.pricing.primary_ips // [] | map(select(.type == "ipv4")) | first | .prices // [] ) as $ipv4
+    | $st.server_types[]
+    | select(.architecture == "x86" and .deprecated != true and .deprecation == null)
+    | select(.cores >= $cores and .memory >= $mem and .disk >= $disk)
+    | . as $t
+    | $t.locations[]
+    | select(.available == true)
+    | select(.name | IN($locs[]))
+    | .name as $loc
+    | ( [ $dc.datacenters[] | select(.server_types.available | index($t.id)) | .location.name ] ) as $dclocs
+    | select( ($dc.datacenters | length) == 0 or ($dclocs | index($loc)) != null )
+    | ( [ $t.prices[] | select(.location == $loc) | .price_hourly.gross | tonumber ] | first ) as $server
+    | select($server != null)
+    | ( ( [ $ipv4[] | select(.location == $loc) | .price_hourly.gross | tonumber ] | first ) // 0 ) as $ip
+    | [ ($server + $ip), "hetzner", $t.name, $loc, $t.cores, $t.memory, $t.disk,
+        $t.cpu_type, "available" ]
+    | @tsv' | sort -g -k1,1
+}
+
+# max: 0 for everything. Bounded here rather than by piping into `head`, which sends
+# the writer a SIGPIPE the moment head has enough — and under `set -o pipefail` that kills
+# the whole run. It cost an `up` that exited after eight seconds having created nothing.
+# max: 0 for everything. Bounded here rather than by piping into `head`, which sends the
+# writer a SIGPIPE the moment head has enough — and under `set -o pipefail` that kills the
+# whole run. It cost an `up` that exited after eight seconds having created nothing.
+#
+# The last two columns are separate on purpose. They were one "NOTE" column and it
+# conflated two different facts: Hetzner publishes a CPU class and no per-offer
+# availability wording, Scaleway the reverse, GCP publishes neither availability nor
+# anything to guess it from — which is why it reads "unknown" rather than "available".
+#
+# EUR/MO sits BESIDE EUR/H and does not replace it. The hourly figure is what the API
+# actually returned and what `up` echoes back the moment it orders; the monthly one is the
+# number anyone reasons with, because nobody budgets in thousandths of a euro. This table
+# is also what hz_up/scw_up/gcp_up print before ordering, so the two of them arrive
+# together at the one moment the choice is still open.
+#
+# Two of the existing nine columns paid for the tenth, and the arithmetic is the point: at
+# %-7s/%-9s the widest row came to 92 characters and a new %-7s column would have taken it
+# to 100, which folds on a 100-column terminal and makes the table unreadable. EUR/H drops
+# to 6 (three decimals of a price under ten is five characters) and CLOUD to 8 (the widest
+# of the three names, "scaleway", is exactly eight — a closed set, so this cannot grow
+# under us). Widest row now 98.
+table() {
+  local rows=$1 max=${2:-0} shown=0
+  printf '  %-6s %-7s %-8s %-14s %-16s %-5s %-5s %-7s %-10s %s\n' \
+    EUR/H EUR/MO CLOUD SHAPE WHERE vCPU RAM DISK CPU AVAIL
+  local price cloud type loc cores mem disk cpu avail
+  while IFS=$'\t' read -r price cloud type loc cores mem disk cpu avail; do
+    [ -n "$price" ] || continue
+    if [ "$max" -gt 0 ] && [ "$shown" -ge "$max" ]; then
+      echo "  … and $(( $(grep -c . <<<"$rows") - max )) more"; break
+    fi
+    printf '  %-6s %-7s %-8s %-14s %-16s %-5s %-5s %-7s %-10s %s\n' \
+      "$(eur "$price")" "$(eur_month "$price")" "$cloud" "$type" "$loc" \
+      "$cores" "${mem}G" "${disk}G" "$cpu" "$avail"
+    shown=$((shown + 1))
+  done <<<"$rows"
+}
+
+# The same rows, as JSON, so `devbox probe --json` is an interface and not a screen.
+#
+# hourly_eur stays the only price here, and EUR/MO deliberately does not follow the column
+# into the contract. A derived value shipped over the wire is a second source of truth: the
+# day MONTH_HOURS moves in one layer and not in the other, a consumer reading the field
+# would disagree with the same consumer computing it, and neither would be wrong. Every
+# layer multiplies by its own named constant instead, which makes a divergence a diff.
+table_json() {
+  # The rows on STDIN, never in an argument. Linux caps a single argument at 128 KB
+  # (MAX_ARG_STRLEN) whatever ARG_MAX says, and macOS does not: `--arg rows` carried
+  # 286 GCP offers on the server happily and died on 1750 with
+  # `/usr/bin/jq: Argument list too long`. The ceiling is on ONE argument, so it cannot be
+  # raised, only avoided — and it is invisible on the workstation, which is what makes it
+  # worth a comment rather than a fix.
+  #
+  # -Rs rather than -Rn: the whole of stdin arrives as one string, which is exactly what
+  # $rows was.
+  printf '%s' "$1" | jq -Rs '
+    [ split("\n")[] | select(length > 0) | split("\t")
+      | { hourly_eur: (.[0] | tonumber), cloud: .[1], type: .[2], location: .[3],
+          cpu: (.[4] | tonumber), ram_gb: (.[5] | tonumber), disk_gb: (.[6] | tonumber),
+          cpu_class: (if .[7] == "-" then null else .[7] end),
+          availability: (if .[8] == "unknown" then null else .[8] end) } ]'
+}
+
+hz_up() {
+  hcloud_token
+  log "asking Hetzner what it can create right now"
+  local rows; rows=$(hz_candidates | pin_filter)
+  [ -n "$rows" ] || die "nothing creatable in $HETZNER_LOCATIONS matching${PIN:+ type $PIN,}
+  x86, >= ${MIN_CORES} vCPU, >= ${MIN_MEMORY_GB} GB, >= ${MIN_DISK_GB} GB disk.
+  devbox probe --all    what there is
+  --cpu/--ram/--disk    a different template
+  DEVBOX_HETZNER_LOCATIONS='fsn1 nbg1 hel1 ash hil sin'   a wider search"
+  table "$rows"
+
+  with_init_lock tf hetzner "$NAME" init -input=false >/dev/null
+
+  # The probe is never enough, so the fallback at apply is not optional. The probe reads
+  # STOCK; the per-project quota is only discovered by ordering, and the two fail
+  # differently — the lesson already written down in terraform/variables.tf, kubevirt branch.
+  local price cloud type loc cores mem disk cpu avail tflog
+  tflog=$(mktemp)
+  while IFS=$'\t' read -r price cloud type loc cores mem disk cpu avail; do
+    log "ordering $type in $loc at $(eur "$price") EUR/h"
+    if tf hetzner "$NAME" apply -auto-approve -input=false \
+         -var "name=$NAME" \
+         -var "server_type=$type" \
+         -var "location=$loc" \
+         -var "hourly_eur=$price" \
+         -var "ssh_public_key=$(cat "$KEY.pub")" 2>&1 | tee "$tflog"; then
+      rm -f "$tflog"; return 0
+    fi
+    grep -qiE 'resource_unavailable|no available server|placement_error|resource unavailable' "$tflog" \
+      || die "apply failed for a reason that trying another machine will not fix (see above)"
+    warn "$type is out in $loc after all, next offer"
+  done <<<"$rows"
+  rm -f "$tflog"
+  die "every creatable offer refused the order"
+}
+
+# --- scaleway ----------------------------------------------------------------
+
+# All THREE, and the access key is the one that is easy to leave out. The probe below signs
+# with the secret alone, so without SCW_ACCESS_KEY `probe` answered and `up` died at the plan:
+# measured on 11/09 against scaleway provider 2.81.0, terraform stops on "scaleway-sdk-go:
+# access key cannot be empty" before it asks anything. Checked here, both verbs refuse at the
+# same line, before an offer is shown that could never be ordered.
+scw_credentials() {
+  [ -n "${SCW_ACCESS_KEY:-}" ] && [ -n "${SCW_SECRET_KEY:-}" ] && [ -n "${SCW_DEFAULT_PROJECT_ID:-}" ] \
+    && { export SCW_ACCESS_KEY SCW_SECRET_KEY SCW_DEFAULT_PROJECT_ID; return 0; }
+  local f=$CONFIG_DIR/.env.tf held
+  if [ -f "$f" ]; then
+    set -a; . "$f"; set +a
+    held="$f holds"
+  else
+    # The dashboard never writes a .env.tf: its credentials arrive in the environment, and
+    # one of three missing there has to be named as such, not as a missing file.
+    [ -n "${SCW_ACCESS_KEY:-}${SCW_SECRET_KEY:-}${SCW_DEFAULT_PROJECT_ID:-}" ] \
+      || die "no Scaleway credentials, and no $f"
+    held="the environment holds"
+  fi
+  [ -n "${SCW_SECRET_KEY:-}" ] || die "$held no SCW_SECRET_KEY.
+  An API key is two values, an access key id and a secret; the project id is a third
+  thing, read off the project's own settings page:
+    SCW_ACCESS_KEY=SCW...
+    SCW_SECRET_KEY=...
+    SCW_DEFAULT_PROJECT_ID=..."
+  [ -n "${SCW_ACCESS_KEY:-}" ] || die "$held no SCW_ACCESS_KEY.
+  The probe would answer without it and terraform would not: the scaleway provider stops
+  the plan on \"access key cannot be empty\". It is the SCW... half of the API key."
+  [ -n "${SCW_DEFAULT_PROJECT_ID:-}" ] || die "$held no SCW_DEFAULT_PROJECT_ID"
+  export SCW_ACCESS_KEY SCW_SECRET_KEY SCW_DEFAULT_PROJECT_ID
+}
+
+scw_api() {
+  local zone=$1 path=$2 body code
+  body=$(curl_auth SCW_SECRET_KEY "X-Auth-Token: $SCW_SECRET_KEY" -sS -w '\n%{http_code}' \
+         "https://api.scaleway.com/instance/v1/zones/$zone/$path")
+  code=${body##*$'\n'}; body=${body%$'\n'*}
+  [ "$code" = 200 ] || die "Scaleway API $zone/$path answered $code: $(jq -r '.message // .' <<<"$body" 2>/dev/null)"
+  printf '%s' "$body"
+}
+
+# Same TSV as the other probes, so one table prints them all:
+#   hourly  type  zone  cores  memory  disk  cpu_type
+#
+# Local-SSD types only, and that is the load-bearing filter rather than a detail. Scaleway
+# splits its catalogue in two, and expresses the split in an easily missed way: a type
+# that takes no local disk reports `l_ssd` from 0 to 0 and a volumes_constraint.max_size
+# of 0. Those need a block volume, which is billed separately and whose price NO Scaleway
+# API publishes — products/volumes returns constraints only, products/ips 404s. Ordering
+# one would mean inventing a constant for hourly_eur, the single field whose job is to
+# mean the same thing on three clouds. So: max_size >= the disk floor, which selects the
+# types whose disk is already inside the published hourly price.
+#
+# Nothing good is lost. On 19/08 the block-backed types were the dearer ones anyway —
+# PLAY2-MICRO at 0.055 and BASIC3-X4C-8G at 0.079 against DEV1-L at 0.0428.
+#
+# What the figure still misses is the public IPv4, for the same absence of an API. It is
+# the one place where hourly_eur is not strictly comparable with Hetzner's, where the
+# primary IP is added in, and it is written down rather than smoothed over.
+scw_candidates() {
+  local z
+  for z in $SCALEWAY_ZONES; do
+    local srv av
+    srv=$(scw_api "$z" 'products/servers?per_page=100')
+    av=$(scw_api "$z" 'products/servers/availability?per_page=100')
+    jq -rn --argjson srv "$srv" --argjson av "$av" --arg z "$z" \
+       --argjson cores "$MIN_CORES" --argjson mem "$MIN_MEMORY_GB" --argjson disk "$MIN_DISK_GB" '
+      $srv.servers | to_entries[]
+      | select(.value.arch == "x86_64")
+      | select(.value.ncpus >= $cores and (.value.ram / 1073741824) >= $mem)
+      | select((.value.volumes_constraint.max_size // 0) / 1000000000 >= $disk)
+      | . as $e
+      | (($av.servers[$e.key].availability) // "unknown") as $a
+      | select($a != "shortage")
+      | [ $e.value.hourly_price, "scaleway", $e.key, $z, $e.value.ncpus,
+          (($e.value.ram / 1073741824) | floor),
+          (($e.value.volumes_constraint.max_size / 1000000000) | floor), "-", $a ]
+      | @tsv'
+  done | sort -g -k1,1
+}
+
+scw_up() {
+  scw_credentials
+  log "asking Scaleway what it can create right now"
+  local rows; rows=$(scw_candidates | pin_filter)
+  [ -n "$rows" ] || die "no x86 offer with >= ${MIN_CORES} vCPU, ${MIN_MEMORY_GB} GB and a local
+  disk of ${MIN_DISK_GB} GB is creatable in: $SCALEWAY_ZONES."
+  table "$rows"
+
+  with_init_lock tf scaleway "$NAME" init -input=false >/dev/null
+
+  local price cloud type zone cores mem disk cpu avail tflog
+  tflog=$(mktemp)
+  while IFS=$'\t' read -r price cloud type zone cores mem disk cpu avail; do
+    log "ordering $type in $zone at $(eur "$price") EUR/h ($avail)"
+    if tf scaleway "$NAME" apply -auto-approve -input=false \
+         -var "name=$NAME" \
+         -var "instance_type=$type" \
+         -var "zone=$zone" \
+         -var "region=${zone%-*}" \
+         -var "root_volume_gb=$MIN_DISK_GB" \
+         -var "hourly_eur=$price" \
+         -var "ssh_public_key=$(cat "$KEY.pub")" 2>&1 | tee "$tflog"; then
+      rm -f "$tflog"; return 0
+    fi
+    # "scarce" is a real state in this API and it means the order can still fail, which is
+    # the same lesson as Hetzner's: the probe reads stock, the quota only shows up when
+    # you order.
+    grep -qiE 'out of stock|no server available|insufficient|quota|resource_exhausted' "$tflog" \
+      || die "apply failed for a reason that trying another machine will not fix (see above)"
+    warn "$type is out in $zone after all, next offer"
+  done <<<"$rows"
+  rm -f "$tflog"
+  die "every creatable offer refused the order"
+}
+
+# --- gcp ---------------------------------------------------------------------
+
+# The credential, and since 31/08 it has two shapes rather than one.
+#
+# ADC on a workstation, unchanged: `gcloud auth application-default login` opens a browser,
+# and that is the right credential for a person sitting in front of one.
+#
+# A SERVICE ACCOUNT KEY anywhere without a browser, which is what let the dashboard order
+# from GCP at all. tf/gcp/versions.tf refused such a key in so many words until that day,
+# and the refusal was aimed at the wrong thing: it argued that a key buys no isolation on
+# GCP, which is true of the OPERATOR's own credential — that one already reaches every
+# project they can see — and false of a service account minted for this and holding two
+# roles in one scratch project. Of the two credentials, the key is the NARROW one. What
+# stays true is that it is long-lived and sits on a disk, so it sits where every other
+# secret of this fleet sits, in 0400, and rotates through the same script.
+#
+# GOOGLE_APPLICATION_CREDENTIALS is not a name chosen here: it is the one the google
+# provider reads. Exporting it is what makes `terraform apply` and this file agree on one
+# credential instead of each finding its own — and a `destroy` that authenticated
+# differently from the `apply` is a machine left running on the meter.
+gcp_key_file() {
+  [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && {
+    printf '%s' "$GOOGLE_APPLICATION_CREDENTIALS"; return 0
+  }
+  [ -s "$SECRETS_DIR/gcp" ] && printf '%s' "$SECRETS_DIR/gcp"
+  return 0
+}
+
+# base64url: what a JWT is made of, and what `openssl base64` is not.
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+# Where a service account's assertion is exchanged for a token, and the only address it is.
+#
+# Written here, no longer read from the key's token_uri. A key is a file someone hands this
+# service - the dashboard's vault takes one from a form - and a key whose token_uri named
+# http://169.254.169.254/ or an address inside the host's network would have had the SERVER
+# post a signed request there and print the first line of whatever came back. That is a
+# request forgery with a reader attached, and on a dashboard meant to take keys from more
+# than one person it is the first thing to close.
+GCP_TOKEN_URI=https://oauth2.googleapis.com/token
+
+# An access token minted from a service account key, without gcloud.
+#
+# Nine lines of openssl and curl, deliberately. The alternative was installing the Google
+# Cloud SDK on the machine that serves every client site, so that one command could return
+# one string — and unattended-upgrades would then be free to raise it under the account
+# that can delete machines. Signing a JWT is the whole of what gcloud does here.
+#
+# The endpoint is GCP_TOKEN_URI whatever the key says. cli/tests still exercises the real
+# signature against a local verifier, by putting a `curl` first in PATH that sends Google's
+# address there - the redirection lives in the test, where no key can reach it.
+gcp_token_from_key() {
+  local key=$1 email foreign now assertion sig body code
+  need openssl
+  need jq
+  [ -s "$key" ] || die "no GCP service account key at $key (empty or absent)."
+  email=$(jq -r '.client_email // empty' <"$key" 2>/dev/null) || email=''
+  [ -n "$email" ] || die "$key is not a service account key: it holds no client_email.
+  What the console hands you is JSON with client_email, private_key and token_uri in it."
+
+  # REFUSED rather than ignored, because this file is not the key's only reader. terraform's
+  # google provider reads GOOGLE_APPLICATION_CREDENTIALS itself, exported below, and it DOES
+  # honour token_uri - and universe_domain, which moves every API it calls onto another
+  # domain. Only a key that names Google's own, or nothing, gets that far. The message names
+  # the fields and never their values: what the key says is the one thing not to repeat.
+  foreign=$(jq -r --arg uri "$GCP_TOKEN_URI" '
+    [ (select((.token_uri // "") != "" and .token_uri != $uri) | "token_uri"),
+      (select((.universe_domain // "") != "" and .universe_domain != "googleapis.com")
+       | "universe_domain") ] | join(" and ")' <"$key" 2>/dev/null) || foreign=''
+  [ -z "$foreign" ] || die "the GCP key at $key names an address that is not Google's (in $foreign), and is refused.
+  devbox sends a key's signed assertion to $GCP_TOKEN_URI and nowhere else, and terraform
+  would follow what the key says. A key downloaded from the console names Google's own
+  addresses; this one was written by hand or altered."
+  now=$(date +%s)
+
+  # cloud-platform, and not two narrower scopes, because a scope is not a permission: what
+  # this key may actually do is what its ROLES say, and those are two, on one project.
+  # Narrowing here would only move the refusal to the middle of an apply.
+  assertion=$(printf '%s' '{"alg":"RS256","typ":"JWT"}' | b64url)
+  assertion=$assertion.$(printf \
+    '{"iss":"%s","scope":"https://www.googleapis.com/auth/cloud-platform","aud":"%s","iat":%s,"exp":%s}' \
+    "$email" "$GCP_TOKEN_URI" "$now" "$((now + 3600))" | b64url)
+
+  # The private half through a PIPE, never through a file and never through an argument:
+  # `ps` shows an argument, and a file is a copy. The first version wrote it with mktemp, in
+  # $TMPDIR or /tmp, which put a disk under a key the dashboard had deliberately laid out in
+  # memory - found on 11/09. `<( )` hands openssl a /dev/fd path onto a pipe fed by jq, so
+  # the key goes from its file to openssl without landing anywhere else.
+  #
+  # Both shells this runs under: bash 3.2 on macOS and bash 5 on Linux implement `<( )`
+  # through /dev/fd, and fall back to a named FIFO only on a system that has none - a FIFO
+  # holds no data on disk either. Measured on 11/09 with bash 3.2 against LibreSSL 3.3.6 and
+  # OpenSSL 3.6.2, byte for byte the signature of the same key read from a file; the Linux
+  # pair is exercised by cli/tests/core-gcp.test.ts, which verifies the signature for real.
+  sig=$(printf '%s' "$assertion" \
+          | openssl dgst -sha256 -sign <(jq -r '.private_key' <"$key") | b64url) \
+    || die "openssl would not sign with the private_key in $key"
+
+  # The assertion travels in the BODY, on stdin: it is a bearer credential for the next
+  # hour and a command line is world-readable. base64url needs no escaping; the one value
+  # that does, the grant type's colons, is written already encoded.
+  body=$(printf 'grant_type=urn%%3Aietf%%3Aparams%%3Aoauth%%3Agrant-type%%3Ajwt-bearer&assertion=%s.%s' \
+           "$assertion" "$sig" \
+         | curl -sS -w '\n%{http_code}' -X POST "$GCP_TOKEN_URI" \
+             -H 'Content-Type: application/x-www-form-urlencoded' --data-binary @-)
+  code=${body##*$'\n'}; body=${body%$'\n'*}
+  [ "$code" = 200 ] || die "$GCP_TOKEN_URI refused the key of $email ($code): $(
+    jq -r '(.error_description // .error // .) | tostring' <<<"$body" 2>/dev/null | head -1)"
+  # A pipe and not <<<, which bash 3.2 - the Mac's - backs with a temporary file: this body
+  # IS the access token, good for an hour.
+  GCP_TOKEN=$(printf '%s' "$body" | jq -r '.access_token // empty')
+  [ -n "$GCP_TOKEN" ] || die "$GCP_TOKEN_URI answered 200 and no access_token"
+
+  # Exported for terraform, and only once a token has actually been obtained: a variable
+  # pointing at a key that cannot mint one would send the provider looking for the same
+  # dead end, thirty seconds into an apply instead of here.
+  export GOOGLE_APPLICATION_CREDENTIALS=$key
+}
+
+gcp_token() {
+  # The project first, because a credential without one has nothing to act on — and this
+  # runs on the same road as a missing credential: `probe` names the cloud in its
+  # `not asked:` line and carries on, `up --cloud gcp` stops here with the variable named.
+  # A service account key carries its own `project_id`, which is NOT read: a key can act on
+  # projects it was not minted in, so reading it would pick the account's default rather
+  # than the one meant for disposable machines.
+  # The FIRST line has to stand on its own: `probe` renders a skipped cloud through
+  # `head -1`, so everything below it is read only by whoever ran `up --cloud gcp`.
+  [ -n "$GCP_PROJECT" ] || die "no GCP project — set DEVBOX_GCP_PROJECT, there is no sane default for one.
+  Use a project of its own, not the one running your production — an instance, a firewall
+  rule and a leaked key all stay inside it:
+    DEVBOX_GCP_PROJECT=<project-id> devbox probe --cloud gcp
+  and export it from your shell profile to stop repeating it. Not ~/.config/devbox/.env:
+  that file is read for DEVBOX_REMOTE alone, one line by sed, and never sourced."
+  [ -n "${GCP_TOKEN:-}" ] && return 0
+  local key; key=$(gcp_key_file)
+  [ -n "$key" ] && { gcp_token_from_key "$key"; return 0; }
+
+  # `need gcloud` was the whole of this, and it named the wrong road: the answer to
+  # "gcloud is required and not in PATH" on a server is not to install a browser-driven
+  # SDK there. Absent and present-but-stale are the same situation for the reader, so they
+  # get the same sentence, and it carries both roads.
+  if command -v gcloud >/dev/null; then
+    GCP_TOKEN=$(gcloud auth application-default print-access-token 2>/dev/null) || true
+    if [ -n "${GCP_TOKEN:-}" ]; then return 0; fi
+  fi
+  die "no GCP credential here.
+  In front of a browser, refresh the Application Default Credentials — this is interactive:
+    gcloud auth application-default login
+  Without one, a service account key, which is what the dashboard runs on:
+    install -m 600 <key>.json $SECRETS_DIR/gcp
+  or anywhere GOOGLE_APPLICATION_CREDENTIALS names, which is looked at first."
+}
+
+gcp_api() {
+  local url=$1 body code
+  body=$(curl_auth "the GCP access token" "Authorization: Bearer $GCP_TOKEN" \
+           -sS -w '\n%{http_code}' "$url")
+  code=${body##*$'\n'}; body=${body%$'\n'*}
+  [ "$code" = 200 ] || die "GCP API answered $code: $(jq -r '.error.message // .' <<<"$body" 2>/dev/null)"
+  printf '%s' "$body"
+}
+
+# The billing catalogue, cached for a day.
+#
+# The spec assumed this was out of reach and budgeted for "a dated static table in the
+# wrapper". It is not out of reach: services/6F81-5844-456A/skus answers to ordinary ADC
+# and takes a currencyCode, so GCP's prices can be read rather than remembered — which is
+# what keeps hourly_eur meaning one thing on three clouds instead of two plus a guess.
+#
+# The catch is volume: 32 255 SKUs over seven pages, several seconds. Prices do not move
+# hourly, so the whole thing lands in a cache file and is re-fetched once a day. A probe
+# should not cost seven API calls to tell you that Hetzner is still cheaper.
+gcp_skus() {
+  local f=$CACHE_DIR/gcp-skus.jsonl
+  if [ -s "$f" ] && [ -z "$(find "$f" -mtime +1 2>/dev/null)" ]; then
+    printf '%s' "$f"; return 0
+  fi
+  install -d -m 700 "$CACHE_DIR"
+  local url='https://cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus?currencyCode=EUR&pageSize=5000'
+  local page='' resp i=0 complete=0
+  : >"$f.new"
+  # 30 and not 10. Seven pages is what the catalogue takes today, and a cap that a growing
+  # catalogue can reach is not a safety net here: reaching it wrote a SHORT file and cached
+  # it for the day. See the refusal below.
+  while [ "$i" -lt 30 ]; do
+    i=$((i + 1))
+    resp=$(gcp_api "${url}${page:+&pageToken=$page}")
+    # FILTERED ON THE WAY IN, and rows only — every field of a kept SKU survives.
+    #
+    # The consumer slurps this whole file into jq to build its rate tables, and jq holds
+    # about six times what a file weighs: the full catalogue is 27 MB, so that slurp alone
+    # was some 155 MB. Measured on the server on 31/08 with a cold cache, the service's
+    # cgroup peaked at 252 MB against a MemoryMax of 256 MB and the probe came back 502.
+    #
+    # Of 32 771 SKUs, 7 182 are ones this file can price from — 27 MB becomes 5,7 MB — and
+    # the rest are support, licences, commitments and every other service Google bills.
+    # Rows and not fields: projecting columns would save another 3 MB and silently starve
+    # the filter the day it reads one more of them.
+    jq -c '.skus[]?
+           | select(.category.usageType == "OnDemand")
+           | select(.category.resourceGroup == "CPU"
+                    or .category.resourceGroup == "RAM"
+                    or (.description | test("^Balanced PD Capacity")))' <<<"$resp" >>"$f.new"
+    page=$(jq -r '.nextPageToken // empty' <<<"$resp")
+    if [ -z "$page" ]; then complete=1; break; fi
+  done
+
+  # A SHORT CATALOGUE IS NEVER CACHED, and this is not a precaution. On 31/08 a run whose
+  # paging stopped early wrote 17 771 SKUs, kept them for the day, and every probe on that
+  # server then reported a different cheapest shape than the same probe on the workstation
+  # — 286 offers against 1 750, in six zones instead of twelve, and nothing said so. A
+  # price list that is quietly missing half its entries still answers.
+  if [ "$complete" != 1 ]; then
+    rm -f "$f.new"
+    die "the GCP billing catalogue did not end after $i pages of 5000.
+  Nothing was cached: half a price list answers as confidently as a whole one, and it
+  would have been believed until tomorrow."
+  fi
+  mv "$f.new" "$f"
+  printf '%s' "$f"
+}
+
+# Same TSV as the other two probes: hourly type zone cores memory disk note
+#
+# GCP prices a machine as cores x core-rate plus GiB x ram-rate, per family, so the figure
+# is assembled rather than looked up. The boot disk is a third line, and it is included
+# for the same reason Hetzner's primary IPv4 is: without it nobody can use the machine, so
+# leaving it out would flatter the number.
+#
+# Availability has no API here at all, which is the one structural difference from the
+# other two clouds. What exists is the regional CPUS quota, checked below, and the error
+# ZONE_RESOURCE_POOL_EXHAUSTED, which only shows up while ordering. So this list is
+# "allowed and priced", not "certainly creatable", and the fallback at apply carries more
+# weight than it does elsewhere.
+gcp_candidates() {
+  local skus
+  skus=$(gcp_skus)
+
+  # Regional CPUS quota first, and the zone list comes back in the same response. A region
+  # with no headroom cannot serve any of its zones, and discovering that by ordering costs
+  # a minute per zone.
+  local r zones='' regions=''
+  for r in $GCP_REGIONS; do
+    local resp
+    resp=$(gcp_api "https://compute.googleapis.com/compute/v1/projects/$GCP_PROJECT/regions/$r")
+    jq -e --argjson c "$MIN_CORES" '(.quotas[] | select(.metric=="CPUS")) | (.limit - .usage) >= $c' \
+       <<<"$resp" >/dev/null || { warn "$r has no CPUS quota headroom, skipped"; continue; }
+    regions="$regions $r"
+    zones="$zones $(jq -r '.zones[] | split("/")[-1]' <<<"$resp")"
+  done
+  [ -n "$zones" ] || return 0
+
+  # Per zone, not the aggregated list: aggregatedList paginates across all 130 zones, so a
+  # single page comes back with the European ones empty and the filter silently useless.
+  #
+  # THROUGH A FILE, and never through --argjson, which is what this was until 31/08. Twelve
+  # zones of machine types is about a megabyte of JSON, and Linux caps a SINGLE argument at
+  # 128 KB (MAX_ARG_STRLEN) however large ARG_MAX is — macOS does not. So the accumulator
+  # worked on the workstation and the server answered
+  # `/usr/bin/jq: Argument list too long`, on the first probe after GCP was offered there.
+  # A here-string is stdin, and stdin has no such ceiling.
+  # ALL AT ONCE. Twelve independent reads that answered one after the other: measured on
+  # 31/08, 4,86 s of a 6,3 s probe — 77 % of it — against 0,88 s for the four region calls
+  # and about 0,6 s of jq. Nothing about them is ordered: each zone's machine types depend
+  # on that zone alone, and the loop below puts them back in the order $zones names.
+  #
+  # gcp_api is deliberately NOT used here. It ends in `die`, and a `die` inside a
+  # background subshell kills that subshell and nothing else — the failure would be
+  # swallowed and the zone would come back silently empty, which is the shape of the bug
+  # that cached half a price catalogue for a day. So the child does the transport only,
+  # writing the body and the status code, and the verdict is pronounced in the foreground
+  # where `die` means what it says.
+  local z dir tf code
+  dir=$(mktemp -d)
+  # A background job's stdin is /dev/null when job control is off, which it is in a script;
+  # curl_auth's pipe is set up inside the function, after that, so each child still reads
+  # its own header.
+  for z in $zones; do
+    curl_auth "the GCP access token" "Authorization: Bearer $GCP_TOKEN" \
+      -sS -o "$dir/$z.json" -w '%{http_code}' \
+      "https://compute.googleapis.com/compute/v1/projects/$GCP_PROJECT/zones/$z/machineTypes?maxResults=200&filter=guestCpus%20%3E%3D%20$MIN_CORES" \
+      >"$dir/$z.code" 2>"$dir/$z.err" &
+  done
+  # No arguments, so this is every child and its status is always 0: the codes below are
+  # what says whether they worked, not this.
+  wait
+
+  tf=$(mktemp)
+  for z in $zones; do
+    code=$(cat "$dir/$z.code" 2>/dev/null) || code=''
+    if [ "$code" != 200 ]; then
+      # Read before the cleanup, said after it: a temporary directory left behind on a
+      # server is how a /tmp fills up over a year of failed probes.
+      local why
+      why=$(jq -r '.error.message // empty' <"$dir/$z.json" 2>/dev/null | head -1)
+      [ -n "$why" ] || why=$(head -1 "$dir/$z.err" 2>/dev/null)
+      rm -rf "$dir"; rm -f "$tf"
+      die "GCP API answered ${code:-nothing} for zone $z: ${why:-no message}"
+    fi
+    jq -c --arg z "$z" '
+      .items[]? | { name, guestCpus, memoryMb, zone: $z,
+                    deprecated: (.deprecated != null),
+                    shared: (.isSharedCpu // false),
+                    arch: (.architecture // "X86_64") }' <"$dir/$z.json" >>"$tf"
+  done
+  rm -rf "$dir"
+
+  # --slurpfile for the same reason, and it reads the NDJSON above back as the array the
+  # filter always expected: one JSON value per line becomes one element.
+  #
+  # The status is carried across the cleanup rather than replaced by it: `rm` succeeds
+  # whatever jq did, and a probe that answered nothing because the filter broke must not
+  # come back as a probe that found nothing.
+  local rc=0
+  jq -rn --slurpfile types "$tf" --slurpfile skus "$skus" --arg regions "$regions" \
+     --argjson mem "$MIN_MEMORY_GB" --argjson disk "$MIN_DISK_GB" '
+    ($regions | split(" ") | map(select(length > 0))) as $regs
+    # family -> per-region core and ram rates, assembled from the catalogue. The
+    # descriptions are not uniform — "N2D AMD Instance Core" — hence the optional vendor.
+    | ( [ $skus[]
+          | select(.category.usageType == "OnDemand")
+          | select(.category.resourceGroup == "CPU" or .category.resourceGroup == "RAM")
+          | . as $s
+          | ($s.description | capture("^(?<fam>[A-Z0-9]+)( AMD| Arm)? Instance (?<kind>Core|Ram) running")) as $m
+          | $s.serviceRegions[]
+          | select(. as $x | $regs | index($x))
+          | { key: "\($m.fam | ascii_downcase)/\(.)/\($m.kind)",
+              value: (((($s.pricingInfo[0].pricingExpression.tieredRates[-1].unitPrice.units // "0") | tonumber))
+                      + ((($s.pricingInfo[0].pricingExpression.tieredRates[-1].unitPrice.nanos // 0)) / 1000000000)) } ]
+        | from_entries ) as $rate
+    # boot disk: published per GiB per month, wanted per hour.
+    | ( [ $skus[]
+          | select(.category.usageType == "OnDemand")
+          | select(.description | test("^Balanced PD Capacity"))
+          | . as $s | $s.serviceRegions[]
+          | select(. as $x | $regs | index($x))
+          | { key: ., value: (((((($s.pricingInfo[0].pricingExpression.tieredRates[-1].unitPrice.units // "0") | tonumber))
+                      + ((($s.pricingInfo[0].pricingExpression.tieredRates[-1].unitPrice.nanos // 0)) / 1000000000))) / 730) } ]
+        | from_entries ) as $pd
+    | $types[]
+    | select(.deprecated | not)
+    # Chrome has no arm64 build for Linux, so ARM shapes build fine right up to the
+    # package and then stop. The API only sets `architecture` when it is NOT x86, hence
+    # the default — which beats blocklisting prefixes: t2a was Ampere, c4a is Axion, and
+    # the next one has not been announced yet.
+    | select(.arch == "X86_64")
+    | select((.memoryMb / 1024) >= $mem)
+    | . as $m
+    | ($m.zone | sub("-[a-z]$"; "")) as $region
+    | ($m.name | split("-")[0]) as $fam
+    | ($rate["\($fam)/\($region)/Core"]) as $c
+    | ($rate["\($fam)/\($region)/Ram"]) as $r
+    | ($pd[$region]) as $d
+    | select($c != null and $r != null and $d != null)
+    | ( ($m.guestCpus * $c) + (($m.memoryMb / 1024) * $r) + ($disk * $d) ) as $price
+    | [ $price, "gcp", $m.name, $m.zone, $m.guestCpus, (($m.memoryMb / 1024) | floor), $disk,
+        (if $m.shared then "shared" else "dedicated" end), "unknown" ]
+    | @tsv' | sort -g -k1,1 || rc=$?
+  rm -f "$tf"
+  return $rc
+}
+
+gcp_up() {
+  gcp_token
+  log "pricing GCP from the billing catalogue (cached daily)"
+  local rows; rows=$(gcp_candidates | pin_filter)
+  [ -n "$rows" ] || die "no priced x86 shape with >= ${MIN_CORES} vCPU and ${MIN_MEMORY_GB} GB in:
+  $GCP_REGIONS — or every one of those regions is out of CPUS quota."
+  table "$rows" 8
+
+  with_init_lock tf gcp "$NAME" init -input=false >/dev/null
+
+  local price cloud type zone cores mem disk cpu avail tflog
+  tflog=$(mktemp)
+  while IFS=$'\t' read -r price cloud type zone cores mem disk cpu avail; do
+    log "ordering $type in $zone at $(eur "$price") EUR/h"
+    if tf gcp "$NAME" apply -auto-approve -input=false \
+         -var "name=$NAME" \
+         -var "project=$GCP_PROJECT" \
+         -var "machine_type=$type" \
+         -var "zone=$zone" \
+         -var "region=${zone%-*}" \
+         -var "boot_disk_gb=$MIN_DISK_GB" \
+         -var "hourly_eur=$price" \
+         -var "ssh_public_key=$(cat "$KEY.pub")" 2>&1 | tee "$tflog"; then
+      rm -f "$tflog"; return 0
+    fi
+    # The one GCP publishes no warning for. A zone runs dry, the order fails, and the next
+    # zone of the same region usually works — which is why the probe lists zones and not
+    # regions.
+    grep -qiE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources|QUOTA_EXCEEDED' "$tflog" \
+      || die "apply failed for a reason that trying another zone will not fix (see above)"
+    warn "$zone is out of $type, next zone"
+  done <<<"$rows"
+  rm -f "$tflog"
+  die "every zone refused the order"
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_up() {
+  local cloud=${DEVBOX_CLOUD:-}
+  local pin='' do_seed=1 cpu_set='' ram_set='' disk_set=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --cloud) takes_value "$@"; cloud=$2; shift 2 ;;
+      --name)  takes_value "$@"; NAME=$2; shift 2 ;;
+      # Floors, not targets: `up` takes the cheapest offer ABOVE them. Named --min-* for
+      # that reason — `--ram 8` reads like "8 GB" and means "8 GB or more", which is the
+      # right behaviour and the wrong word.
+      --min-cpu|--cpu)   takes_value "$@"; MIN_CORES=$2; cpu_set=1; shift 2 ;;
+      --min-ram|--ram)   takes_value "$@"; MIN_MEMORY_GB=$2; ram_set=1; shift 2 ;;
+      --min-disk|--disk) takes_value "$@"; MIN_DISK_GB=$2; disk_set=1; shift 2 ;;
+      # Pins a shape instead of taking the cheapest above the floor. Still goes through
+      # the probe, so an offer that is not creatable anywhere is refused before ordering
+      # rather than at apply.
+      --type)  takes_value "$@"; pin=$2; shift 2 ;;
+      --profile) takes_value "$@"; PROFILE=$2; shift 2 ;;
+      --repo)    takes_value "$@"; REPO_URL=$2; shift 2 ;;
+      # The two phases exist because secrets must not travel in the user-data, which is a
+      # reason of implementation and no reason at all to type two commands. They are
+      # chained unless you want the machine bare — to seed it later, or to look at what
+      # phase 1 left behind when it failed.
+      --no-seed) do_seed=0; shift ;;
+      # Suppresses the closing summary, and only that. The dashboard passes it because it
+      # runs devbox on a SERVER: the Termius card printed there carries the server's own
+      # local forward port, read from the server's ssh config, which is not the port the
+      # reader's machine allocated. Printing it would advise a port that reaches nothing.
+      --quiet) QUIET=1; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+  PIN=$pin
+
+  # Delegated, and nothing below this runs: no probe, no apply, no state. The floors are
+  # sent ONLY when a flag set them, because the dashboard reads the profile header itself
+  # and re-deciding here would be a second place for those defaults to live.
+  if [ -n "$REMOTE" ]; then
+    need jq
+    local payload answer id machine
+    payload=$(jq -n \
+      --arg profile "$PROFILE" \
+      --arg cloud "${cloud:-hetzner}" \
+      --arg name "$NAME" \
+      --arg repo "$REPO_URL" \
+      --arg type "$pin" \
+      --arg cpu "${cpu_set:+$MIN_CORES}" \
+      --arg ram "${ram_set:+$MIN_MEMORY_GB}" \
+      --arg disk "${disk_set:+$MIN_DISK_GB}" \
+      --argjson seed "$([ "$do_seed" = 1 ] && echo true || echo false)" \
+      '{ profile: $profile, cloud: $cloud, seed: $seed }
+       + (if $name == "" then {} else { name: $name } end)
+       + (if $repo == "" then {} else { repo: $repo } end)
+       + (if $type == "" then {} else { type: $type } end)
+       + (if $cpu  == "" then {} else { cpu:  ($cpu  | tonumber) } end)
+       + (if $ram  == "" then {} else { ram:  ($ram  | tonumber) } end)
+       + (if $disk == "" then {} else { disk: ($disk | tonumber) } end)')
+    answer=$(remote_api POST /api/machines "$payload") || exit 1
+    id=$(jq -r '.job' <<<"$answer")
+    machine=$(jq -r '.machine' <<<"$answer")
+    log "$REMOTE, job $id, machine $machine"
+    remote_follow "$id"
+    ensure_key
+    remote_sync_one "$machine"
+    echo
+    cmd_info "$machine"
+    return 0
+  fi
+
+  NAME=${NAME:-$(random_name)}
+  case "$NAME" in
+    *[!a-zA-Z0-9_-]*) die "a machine name must be letters, digits, dash or underscore: '$NAME'" ;;
+  esac
+  if instances | awk -v w="$NAME" '$2 == w { found = 1 } END { exit !found }'; then
+    die "a machine named '$NAME' already exists and is on the meter.
+  devbox ls              every machine
+  devbox info $NAME      its connection details
+  devbox down $NAME      destroy it
+  devbox up --name other  a second one, alongside"
+  fi
+
+  need terraform; need jq; need curl; need ssh-keyscan; need nc
+  ensure_key
+
+  # The profile is read before anything is ordered, because it is what says how big the
+  # machine has to be. A flag still wins: the header is a default, not a decree.
+  local pf
+  pf=$(profile_path "$PROFILE")
+  [ -n "$REPO_URL" ] || REPO_URL=$(profile_meta "$pf" repo)
+  [ -n "${cpu_set:-}"  ] || MIN_CORES=$(profile_meta "$pf" min-cpu)     ; MIN_CORES=${MIN_CORES:-4}
+  [ -n "${ram_set:-}"  ] || MIN_MEMORY_GB=$(profile_meta "$pf" min-ram) ; MIN_MEMORY_GB=${MIN_MEMORY_GB:-8}
+  [ -n "${disk_set:-}" ] || MIN_DISK_GB=$(profile_meta "$pf" min-disk)  ; MIN_DISK_GB=${MIN_DISK_GB:-80}
+  # Checked here, before anything is ordered, and not at write_ssh_config minutes later: a
+  # port ssh cannot read would refuse the whole config, and the machine would be billing.
+  local ports
+  ports=$(port_list "$(profile_meta "$pf" port)") \
+    || die "$pf: devbox-port is not a list of ports between 1 and 65535: '$(profile_meta "$pf" port)'"
+  log "profile $PROFILE${REPO_URL:+ — $REPO_URL}"
+
+  cloud=${cloud:-hetzner}
+  case "$cloud" in
+    hetzner)  hz_up ;;
+    scaleway) scw_up ;;
+    gcp)      gcp_up ;;
+    *) die "unknown cloud: $cloud" ;;
+  esac
+
+  local o ip user port
+  o=$(outputs "$cloud" "$NAME")
+  ip=$(out "$o" ip); user=$(out "$o" user); port=$(out "$o" port)
+  wait_ssh "$ip" "$port"
+  refresh_known_hosts "$ip" "$port"
+  with_lock write_ssh_config "$ip" "$user" "$port" "$NAME" \
+    "${ports:-9010}" "$PROFILE"
+
+  # Phase 1 ends the same way on every cloud — the marker at /var/log/devbox-provision-done.
+  # Waited on here rather than in seed, which keeps the failure legible: a broken phase 1
+  # should not look like a broken seed.
+  #
+  # cloud-init is still installing the toolchain at this point: sshd answers minutes before
+  # phase 1 is done.
+  log "waiting for phase 1 (toolchain, docker) — 3 to 6 min"
+  if ! ssh_to "$ip" "$user" "$port" \
+       'cloud-init status --wait >/dev/null 2>&1; test -f /var/log/devbox-provision-done'; then
+    warn "phase 1 did not reach its marker. What it got to:"
+    ssh_to "$ip" "$user" "$port" 'sudo tail -30 /var/log/cloud-init-output.log' || true
+    die "fix it over SSH (/usr/local/bin/devbox-provision.sh is re-runnable), then: devbox seed"
+  fi
+
+  if [ "$do_seed" = 1 ]; then
+    cmd_seed "$NAME" ${QUIET:+--quiet}
+  else
+    [ -n "${QUIET:-}" ] && return 0
+    echo
+    cmd_info "$NAME"
+    echo
+    bold "  Bare machine, phase 2 not run: devbox seed $NAME"
+  fi
+}
+
+# Written to be typed on a phone. Termius on iOS, with no desktop and no cloud sync, means
+# ~/.ssh/config is never imported: these are the fields, named as the app names them, in
+# the order it asks for them.
+# `resolve`, for the fleet the dashboard holds: with one machine there is nothing to
+# disambiguate, with several the command refuses rather than guess. Same rule, other
+# source, because picking the wrong target for `down` is still the mistake that destroys
+# work.
+remote_resolve() {
+  local want=${1:-} names
+  names=$(remote_api GET /api/machines | jq -r '.[].name') || exit 1
+  [ -n "$names" ] || die "no machine. devbox up"
+  if [ -n "$want" ]; then
+    grep -qx -- "$want" <<<"$names" || die "no machine named '$want'. devbox ls"
+    printf '%s' "$want"; return 0
+  fi
+  [ "$(grep -c . <<<"$names")" = 1 ] && { printf '%s' "$names"; return 0; }
+  die "several machines exist, name the one you mean:
+$(sed 's/^/    /' <<<"$names")"
+}
+
+# One machine, described in full: the fleet's fields plus the three this screen needs and
+# `ls` does not. The dashboard answers exactly this shape, which is what lets both sides
+# feed the same renderer.
+detail_json() {
+  local want=${1:-} where
+  # Assigned first, never inlined into the argument. A `die` inside a substitution only
+  # kills that subshell, and inline it would leave an empty name in the path: the
+  # message would be followed by a second, meaningless 404.
+  local pick; pick=$(resolve_any "$want") || exit 1
+  read -r where want <<<"$pick"
+  if [ "$where" = remote ]; then
+    remote_api GET "/api/machines/$want"
+    return 0
+  fi
+
+  # Same shape, one question further: resolve_any answered WHERE, and this answers which
+  # workspace holds it. Same trap as above — `read` succeeds on the empty line a dead
+  # subshell leaves behind, so without the `|| exit 1` the refusal to guess would be
+  # followed by the whole command carrying on with an empty cloud and an empty name.
+  local cloud name; pick=$(resolve "$want") || exit 1
+  read -r cloud name <<<"$pick"
+  local o ip port fp app kube prof note
+  o=$(outputs "$cloud" "$name")
+  ip=$(out "$o" ip); port=$(out "$o" port)
+  fp=$(host_fingerprint "$ip" "$port")
+  app=$(local_port "$name"); app=${app:-9010}
+  kube=$(( 16443 + app - 9010 ))
+  prof=$(profile_of "$name")
+  note=''
+  if [ -n "$prof" ]; then note=$(profile_meta "$(profile_path "$prof" 2>/dev/null)" note 2>/dev/null) || note=''; fi
+
+  machine_json "$cloud" "$name" \
+    | jq --arg fp "$fp" --arg note "$note" --argjson kube_port "$kube" \
+         '. + { fingerprint: (if $fp == "" then null else $fp end),
+                note: (if $note == "" then null else $note end),
+                kube_port: $kube_port }'
+}
+
+field_of() { jq -r --arg k "$2" '.[$k] // empty' <<<"$1"; }
+
+# Every machine this Mac has a Host block for. The markers are the registry, as they
+# already are for the local port and the profile.
+ssh_config_names() {
+  [ -f "$SSH_CONFIG" ] || return 0
+  sed -n 's/^# >>> devbox:\(.*\) >>>$/\1/p' "$SSH_CONFIG"
+}
+
+# The two things the dashboard cannot do for this Mac: teach ssh where the machine is, and
+# accept its host key. The local forward port is allocated HERE, by next_local_port,
+# against this Mac's own config and its own listening sockets. The server has no opinion
+# on that, and rightly: its ports are not yours.
+remote_sync_one() {
+  local name=$1 d ip user port app prof
+  d=$(remote_api GET "/api/machines/$name") || exit 1
+  ip=$(field_of "$d" ip); user=$(field_of "$d" user); port=$(field_of "$d" port)
+  # app_ports from a dashboard that knows the list, app_port from one that does not.
+  app=$(jq -r '(.app_ports // [.app_port] | map(select(. != null)) | join(" "))' <<<"$d")
+  prof=$(field_of "$d" profile)
+  [ -n "$ip" ] || die "$REMOTE described '$name' without an address"
+  refresh_known_hosts "$ip" "${port:-22}"
+  with_lock write_ssh_config "$ip" "$user" "${port:-22}" "$name" "${app:-9010}" "$prof"
+}
+
+# Reconciles ~/.ssh/config with the fleet the dashboard holds.
+#
+# This is the command that recolls the two worlds after a machine is created from a phone:
+# nothing on this Mac knew it existed, so `ssh <name>` had nothing to read. It is manual
+# on purpose. A launchd agent doing it every five minutes would hold an API token in a
+# resident process and rewrite ~/.ssh/config unasked, and this repository has already
+# measured what concurrent read-modify-write costs on that file.
+cmd_sync() {
+  need jq
+  [ -n "$REMOTE" ] || die "devbox sync needs DEVBOX_REMOTE set.
+  Without it the local state IS the source of ~/.ssh/config, and there is nothing to
+  reconcile it with."
+  ensure_key
+
+  local rows names name added=0 removed=0
+  rows=$(remote_api GET /api/machines) || exit 1
+  names=$(jq -r '.[].name' <<<"$rows")
+
+  while read -r name; do
+    [ -n "$name" ] || continue
+    remote_sync_one "$name"
+    added=$((added + 1))
+  done <<<"$names"
+
+  # And the blocks whose machine is gone. Left behind, the next machine to take that
+  # address opens on a changed-identity warning, and Termius refuses the connection
+  # outright rather than asking.
+  while read -r name; do
+    [ -n "$name" ] || continue
+    grep -qx -- "$name" <<<"$names" && continue
+    with_lock drop_ssh_config "$name"
+    removed=$((removed + 1))
+  done < <(ssh_config_names)
+
+  log "$added block(s) written, $removed removed"
+}
+
+# Written to be typed on a phone. Termius on iOS, with no desktop and no cloud sync, means
+# ~/.ssh/config is never imported: these are the fields, named as the app names them, in
+# the order it asks for them.
+info_screen() {
+  local d=$1 name app dest kube note hourly
+  name=$(field_of "$d" name)
+  app=$(field_of "$d" local_port)
+  dest=$(field_of "$d" app_port)
+  kube=$(field_of "$d" kube_port)
+  note=$(field_of "$d" note)
+  # Read once into a variable rather than twice out of the JSON: this line already reaches
+  # into $d four times, and a fifth and sixth jq for the same field would be the only two
+  # that had to agree with each other.
+  hourly=$(field_of "$d" hourly_eur)
+
+  echo
+  bold "$name — $(field_of "$d" cloud) / $(field_of "$d" region) / $(field_of "$d" instance_type) — $(eur "$hourly") €/h, $(eur_month "$hourly") €/mo"
+  echo
+  echo "  Termius > Hosts > +"
+  printf '    %-11s %s\n' 'Address'   "$(field_of "$d" ip)"
+  printf '    %-11s %s\n' 'Port'      "$(field_of "$d" port)"
+  printf '    %-11s %s\n' 'Username'  "$(field_of "$d" user)"
+  printf '    %-11s %s\n' 'Key'       "devbox   (the one already in your keychain)"
+  printf '    %-11s %s\n' 'Fingerprint' "$(field_of "$d" fingerprint)"
+  echo "                (compare with what Termius shows on first connect)"
+  echo
+  echo "  Termius > this host > Port forwarding > + > Local"
+  printf '    %-11s %s\n' 'Local'     "$app"
+  printf '    %-11s %s\n' 'Dest host' "localhost"
+  # Read from the profile, not assumed: this line printed a hardcoded 9010 until 20/08,
+  # which handed a wrong Termius forward to every profile not serving on that port.
+  # write_ssh_config had always honoured devbox-port, and only this screen lied.
+  printf '    %-11s %s\n' 'Dest port' "$dest"
+  echo "                then http://localhost:$app in Safari"
+  [ -n "$note" ] && echo "                $note"
+  # The other ports the profile forwards, one Termius rule each, with the local ports this
+  # config gave them. A block written before the list holds only the app's: `devbox sync`.
+  local more
+  more=$(jq -r '(.forwards // [])[1:][] | "\(.local) \(.remote)"' <<<"$d")
+  if [ -n "$more" ]; then
+    echo
+    echo "    and one more rule per port:"
+    while read -r l r; do
+      printf '    %-11s %s → localhost:%s\n' 'Local' "$l" "$r"
+    done <<<"$more"
+  fi
+  echo
+  echo "    kubectl, if you want it: $kube → localhost:6443"
+  echo
+  echo "  From the Mac, the block is already in ~/.ssh/config:"
+  echo "    ssh $name          the session and every forward"
+  echo "    ssh -fN $name      the forwards alone, backgrounded"
+}
+
+# The session itself, on the machine you name.
+#
+# Read from ~/.ssh/config and from nothing else, which is not a shortcut. The Host block
+# already holds the address, the user, the port, the key and BOTH forwards, and when the
+# dashboard is the executor it is the only thing on this Mac that holds any of them. So
+# this verb is exactly `ssh <name>` with the two questions answered that the bare command
+# leaves open: which machine, when there is only one, and what to say when there is no
+# block — ssh's own answer to that is "Could not resolve hostname", which names neither
+# devbox nor `devbox sync`.
+#
+# It asks no cloud and no dashboard, so it is deliberately absent from the version gate's
+# allowlist: nothing here can disagree with what a server runs.
+#
+# `exec`, so the shell is REPLACED rather than left waiting. What holds the terminal is
+# then ssh itself — its escape sequences, its signals, its exit status — and not a wrapper
+# that would have to forward all three and would get one of them wrong.
+cmd_ssh() {
+  local want='' names
+  while [ $# -gt 0 ]; do
+    case $1 in
+      -*) die "unknown flag for ssh: $1
+  This verb takes a machine name and nothing else. Anything ssh itself understands —
+  a command to run, a flag, another forward — goes to ssh: devbox ssh names the machine,
+  and \`ssh <name> …\` is the same session with your own arguments on it." ;;
+      '') shift ;;
+      *) want=$1; shift ;;
+    esac
+  done
+
+  names=$(ssh_config_names)
+  [ -n "$names" ] || die "no machine has a Host block on this Mac.
+  devbox ls      what exists
+  devbox sync    write the blocks for a fleet the dashboard holds"
+
+  # The same rule as resolve(), against the registry that ssh will actually read: one
+  # machine needs no ceremony, several will not be guessed at.
+  if [ -z "$want" ]; then
+    [ "$(grep -c . <<<"$names")" = 1 ] || die "several machines, name the one you mean:
+$(sed 's/^/    /' <<<"$names")"
+    want=$names
+  elif ! grep -qx "$want" <<<"$names"; then
+    die "no Host block for '$want' on this Mac.
+  devbox ls      what exists
+  devbox sync    write the blocks for a fleet the dashboard holds"
+  fi
+
+  log "ssh $want"
+  exec ssh "$want"
+}
+
+# The forwards, without a session, and on whatever ports you want.
+#
+# `ssh <name>` already opens them: the Host block carries them, so an ordinary login gives
+# both. This is for the other two cases, wanting them WITHOUT a shell, and wanting them
+# somewhere other than where they were allocated.
+#
+# Idempotent, because the common mistake is to run it twice and read
+# "bind: Address already in use" as a failure rather than as "it is already open". That
+# message comes from ssh, which has no idea a tunnel to this same machine is the reason.
+#
+# The address is used rather than the Host alias, and deliberately: going through the
+# alias would add the block's own LocalForward lines to the ones asked for here, and
+# --port would collide with the port it was chosen to avoid.
+cmd_tunnel() {
+  need jq
+  local want='' close=0 local_port='' kube_port=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --close|--down) close=1; shift ;;
+      --port) takes_value "$@"; local_port=$2; shift 2 ;;
+      --kube) takes_value "$@"; kube_port=$2; shift 2 ;;
+      -*) die "unknown flag for tunnel: $1" ;;
+      '') shift ;;
+      *) want=$1; shift ;;
+    esac
+  done
+
+  local port
+  for port in $local_port $kube_port; do
+    case "$port" in
+      ''|*[!0-9]*) die "a port is digits: '$port'" ;;
+    esac
+    [ "$port" -ge 1024 ] && [ "$port" -le 65535 ] || die "a port belongs between 1024 and 65535: $port"
+  done
+
+  local d; d=$(detail_json "$want") || exit 1
+  local name ip user sshport dest
+  name=$(field_of "$d" name)
+  ip=$(field_of "$d" ip)
+  user=$(field_of "$d" user)
+  sshport=$(field_of "$d" port)
+  dest=$(field_of "$d" app_port)
+  local chosen=${local_port:+1}
+  local_port=${local_port:-$(field_of "$d" local_port)}
+  # Machine n is 9010+n and 16443+n, so one number identifies it everywhere. A chosen
+  # port keeps the same offset rather than inventing a second rule.
+  kube_port=${kube_port:-$(( 16443 + local_port - 9010 ))}
+
+  if [ "$close" = 1 ]; then
+    # Only what this command opened. An interactive `ssh <name>` holds the same ports, and
+    # killing someone's session to free a port is not a tunnel command's business.
+    if pkill -f "ssh -fN .*$ip" 2>/dev/null; then
+      log "tunnel to $name closed"
+    else
+      log "no tunnel of ours was open for $name"
+    fi
+    if listening "$local_port"; then
+      warn "$local_port is still held, by an ssh session rather than a tunnel.
+  Leave that session, or: devbox tunnel $name --port <other>"
+    fi
+    return 0
+  fi
+
+  if listening "$local_port"; then
+    log "already open on $local_port"
+    echo "  http://localhost:$local_port"
+    echo "  devbox tunnel $name --close    to close it"
+    echo "  devbox tunnel $name --port N   to open a second one elsewhere"
+    return 0
+  fi
+
+  # The profile's other ports, on the local ports this Mac's Host block gave them, or - with
+  # no block, or a --port chosen - on the app's local port plus 1000 per rank, the rule
+  # write_ssh_config starts from. ExitOnForwardFailure makes a taken one a clean refusal.
+  local extras='' shown='' rank=0 remote l
+  for remote in $(jq -r '(.app_ports // [])[1:][]' <<<"$d"); do
+    case "$remote" in *[!0-9]*|'') continue ;; esac
+    rank=$((rank + 1))
+    l=''
+    [ -n "$chosen" ] || l=$(forwards_of "$name" | awk -v r="$remote" '$2 == r { print $1; exit }')
+    l=${l:-$((local_port + 1000 * rank))}
+    extras="$extras -L $l:127.0.0.1:$remote"
+    shown="$shown$l $remote
+"
+  done
+
+  # $extras unquoted on purpose: words of digits, colons and dots, split into -L pairs.
+  # shellcheck disable=SC2086
+  ssh -fN -i "$KEY" -p "$sshport" \
+      -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new \
+      -o ExitOnForwardFailure=yes \
+      -L "$local_port:127.0.0.1:$dest" \
+      -L "$kube_port:127.0.0.1:6443" \
+      $extras \
+      "$user@$ip" || die "the tunnel would not open. Is $local_port or $kube_port taken?"
+
+  log "tunnel to $name open"
+  echo "  http://localhost:$local_port          the app, served on $dest inside"
+  printf '%s' "$shown" | while read -r l remote; do
+    [ -n "$l" ] && printf '  http://localhost:%-6s        %s inside\n' "$l" "$remote"
+  done
+  echo "  localhost:$kube_port                     kubectl, 6443 inside"
+  local note; note=$(field_of "$d" note)
+  [ -n "$note" ] && echo "  $note"
+  echo "  devbox tunnel $name --close    to close it"
+}
+
+# Whether anything holds a local port. lsof answers non-zero when nothing does, and it is
+# absent on some minimal images, where "not listening" is the safe read: the worst case is
+# ssh saying so itself, which ExitOnForwardFailure turns into a clean failure.
+listening() {
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+cmd_info() {
+  need jq
+  local json=0 want=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --json) json=1; shift ;;
+      -*) die "unknown flag: $1" ;;
+      '')  shift ;;
+      *)   want=$1; shift ;;
+    esac
+  done
+
+  local d; d=$(detail_json "$want") || exit 1
+  [ "$json" = 1 ] && { printf '%s\n' "$d"; return 0; }
+  info_screen "$d"
+}
+
+# Read once, cached at 600, never on a command line and never in the shell history —
+# the same posture as `make secret`, which pipes through read -s for the same reason.
+secret_value() {
+  local name=$1 prompt=$2 envvar=$3
+  # Split from the line above on purpose: bash expands every word of a `local` before it
+  # performs any of its assignments, so $name here would still be unset and `set -u`
+  # would kill the command.
+  local file=$SECRETS_DIR/$name
+  local v=${!envvar:-}
+  [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  if [ -s "$file" ]; then cat "$file"; return 0; fi
+  install -d -m 700 "$SECRETS_DIR"
+  printf '%s (not echoed): ' "$prompt" >&2
+  read -rs v; echo >&2
+  [ -n "$v" ] || die "empty, nothing sent"
+  (umask 077; printf '%s' "$v" >"$file")
+  printf '%s' "$v"
+}
+
+cmd_seed() {
+  need jq
+  local cloud name want='' profile_set=''
+  # One loop, and the name is wherever it is. Read only from position 1, `devbox seed
+  # --profile bare devbox-one` parsed as "seed something, with profile bare" and the trailing
+  # `*) shift ;;` ate the name in silence — so against a single-machine fleet it seeded
+  # THAT machine under a profile it was never provisioned with, and never mentioned the
+  # name it had dropped. The same `*) shift ;;` swallowed `--nawak` and a misspelled
+  # `--profil` just as quietly.
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --profile) takes_value "$@"; PROFILE=$2; profile_set=1; shift 2 ;;
+      --repo)    takes_value "$@"; REPO_URL=$2; shift 2 ;;
+      --quiet)   QUIET=1; shift ;;
+      '') shift ;;
+      -*) die "unknown flag for seed: $1" ;;
+      *) [ -z "$want" ] || die "seed acts on one machine, and you named two: $want and $1"
+         want=$1; shift ;;
+    esac
+  done
+
+  # Delegated. The secrets stay on the server, which is the point: with the dashboard
+  # seeding, this Mac has no reason to hold a Claude or a GitHub token at all.
+  #
+  # resolve_any rather than a test on `want`, because `devbox seed` with no name at all is
+  # the ordinary way to type this: the question "which machine" has to be settled before
+  # the answer can say which side is to carry it out.
+  local where; where=$(resolve_any "$want") || exit 1
+  read -r where want <<<"$where"
+  if [ "$where" = remote ]; then
+    local rname id
+    rname=$want
+    id=$(remote_api POST "/api/machines/$rname/seed" \
+           "$(jq -n --arg p "${profile_set:+$PROFILE}" --arg r "$REPO_URL" \
+              '{} + (if $p == "" then {} else { profile: $p } end)
+                  + (if $r == "" then {} else { repo: $r } end)')" | jq -r '.job')
+    log "$REMOTE, job $id"
+    remote_follow "$id"
+    echo
+    cmd_info "$rname"
+    return 0
+  fi
+
+  # Assigned first, never inlined into the here-string, for the reason `detail_json`
+  # gives: a `die` inside a substitution only kills that subshell. `read` would then
+  # succeed on the empty line it was handed, and the refusal to guess would be
+  # followed by the command carrying on with an empty cloud and an empty name.
+  local pick; pick=$(resolve "$want") || exit 1
+  read -r cloud name <<<"$pick"
+
+  # With no --profile, re-use the one this machine was provisioned with rather than
+  # DEVBOX_PROFILE: seeding a `claude` machine with `opencode` because you forgot a flag would
+  # be a silent swap.
+  #
+  # With NO --profile, and not "with --profile equal to the default", which is what this
+  # tested until 11/09 and which cannot tell `seed` from `seed --profile <default>`. The
+  # dashboard passes --profile exactly when one was asked for, and lays out the secrets of THAT
+  # profile and no other: a machine recorded as `claude` and seeded with `--profile bare` was switched
+  # back to claude here, asked for a claude token its launch did not hold, and died on "empty,
+  # nothing sent". A profile typed is a profile meant, whatever its name.
+  local recorded
+  recorded=$(profile_of "$name")
+  [ -n "$recorded" ] && [ -z "$profile_set" ] && PROFILE=$recorded
+
+  local pf secrets
+  pf=$(profile_path "$PROFILE")
+  secrets=$(profile_meta "$pf" secrets)
+  [ -n "$REPO_URL" ] || REPO_URL=$(profile_meta "$pf" repo)
+
+  local o ip user port
+  o=$(outputs "$cloud" "$name")
+  ip=$(out "$o" ip); user=$(out "$o" user); port=$(out "$o" port)
+
+  # Whatever the profile declared, by whatever name. Nothing here knows what "claude" or
+  # "openai" mean — they are file names under /run/secrets, and only the profile reads them.
+  #
+  # Held in shell variables and NEVER in a temporary file. The first version of this loop
+  # wrote each value to /tmp so the GitHub preflight below could read it back, and on macOS
+  # /tmp is /private/tmp — on disk, and with the default umask of 022 the tokens landed
+  # world-readable for the length of a seed. eval rather than an associative array because
+  # macOS ships bash 3.2, which has none.
+  #
+  # The name is validated first: it becomes a path under /run/secrets and a variable name
+  # here, so a profile declaring "../../etc/shadow" must not be taken at its word.
+  local n v
+  for n in $secrets; do
+    case "$n" in
+      *[!a-zA-Z0-9_-]*|'') die "invalid secret name in $PROFILE: '$n' (letters, digits, dash, underscore)" ;;
+    esac
+    v=$(secret_value "$n" "secret $n" "DEVBOX_$(printf '%s' "$n" | tr 'a-z-' 'A-Z_')_TOKEN")
+    eval "DEVBOX_HELD_${n//-/_}=\$v"
+  done
+
+  # Only when the profile asks for github AND the repository is on github. Checked from
+  # here rather than discovered thirty seconds into phase 2, because of how misleadingly
+  # it fails: a fine-grained PAT left on its default "Public repositories" cannot see a
+  # private repo, the API answers 404, and git answers "remote: Write access to repository
+  # not granted" on a plain clone — a message about writing, on a read.
+  case " $secrets " in
+    *" github "*)
+      case "$REPO_URL" in
+        https://github.com/*)
+          local slug code pulls
+          slug=$(printf '%s' "$REPO_URL" | sed -E 's#^https://github\.com/##; s#\.git$##')
+          # Asked out here, because both calls below throw stderr away: curl_auth's refusal
+          # would vanish with it, and the seed would carry on to a clone that cannot work.
+          single_line "$DEVBOX_HELD_github" || die "the github secret holds a line break, which no HTTP header can carry. Nothing was sent."
+          code=$(curl_auth "the github secret" "Authorization: Bearer $DEVBOX_HELD_github" \
+                 -sS -o /dev/null -w '%{http_code}' \
+                 "https://api.github.com/repos/$slug" 2>/dev/null || echo 000)
+          case $code in
+            200)
+              # Contents is now proven. Pull requests are NOT, and they are a separate
+              # permission: a token holding Contents alone clones, pushes a branch, and
+              # then answers 403 to `gh pr create` — the one thing a machine running an
+              # agent was given the token for.
+              #
+              # Nothing lists what a fine-grained token may do, so this asks the
+              # pull-request endpoint instead. A 403 proves the permission is absent. A
+              # 200 proves only that it can READ them, which is why this warns rather
+              # than dies — and why a profile that never opens a pull request is not
+              # stopped by a permission it does not want.
+              pulls=$(curl_auth "the github secret" "Authorization: Bearer $DEVBOX_HELD_github" \
+                      -sS -o /dev/null -w '%{http_code}' \
+                      "https://api.github.com/repos/$slug/pulls?per_page=1" 2>/dev/null || echo 000)
+              if [ "$pulls" = 403 ]; then
+                warn "the GitHub token cannot see the pull requests of $slug.
+  It will clone and push; \`gh pr create\` will answer 403:
+    github.com/settings/personal-access-tokens -> this token
+      Permissions -> Pull requests: Read and write"
+              fi ;;
+            403|404) die "the GitHub token cannot see $slug (HTTP $code).
+  Fine-grained tokens default to \"Public repositories\", and this one is private:
+    github.com/settings/personal-access-tokens -> this token
+      Repository access -> Only select repositories -> $slug
+      Permissions -> Contents: Read and write
+                     Pull requests: Read and write   (to open one, not just to push)
+  Editing the token keeps its value, so nothing has to be re-entered here." ;;
+            *) warn "the GitHub API answered $code for $slug, carrying on anyway" ;;
+          esac ;;
+      esac ;;
+  esac
+
+  # Not through cloud-init. The user-data is readable by any process on the machine
+  # through the metadata service, and cloud-init keeps a copy under /var/lib/cloud. These
+  # arrive over SSH into /run, which is tmpfs, and die with the machine. 0400 owned by the
+  # guest user is the convention the kubevirt branch's API already applied — root-owned
+  # 600 was the first version, and the clone died on "Invalid username or token" because
+  # the git credential helper runs as dev and could not read the file.
+  # Through a pipe, not a here-string: bash implements <<< with a temporary FILE, which is
+  # the very thing this loop was just rewritten to avoid. A pipe touches no filesystem.
+  log "pushing the secrets into /run/secrets (tmpfs): $secrets"
+  for n in $secrets; do
+    eval "v=\$DEVBOX_HELD_${n//-/_}"
+    printf '%s' "$v" | ssh_to "$ip" "$user" "$port" \
+      "sudo install -d -m 700 -o $user -g $user /run/secrets \
+       && sudo sh -c 'umask 077; cat > /run/secrets/$n' \
+       && sudo chown $user:$user /run/secrets/$n && sudo chmod 400 /run/secrets/$n"
+  done
+
+  # The profile travels now, not at `up`: that is what lets the same machine be
+  # re-provisioned with another one, and keeps the user-data free of any choice.
+  #
+  # The prelude travels with it, for the same reason and one more: cloud-init deposited a
+  # copy at boot, so a machine created yesterday would otherwise keep yesterday's helpers
+  # forever. Re-sending it costs nothing and makes `devbox seed` the way a running machine
+  # picks up a fix.
+  log "profile $PROFILE"
+  ssh_to "$ip" "$user" "$port" \
+    "sudo sh -c 'install -d -m 755 /usr/local/lib/devbox; cat > /usr/local/lib/devbox/prelude.sh'" <"$HERE/prelude.sh"
+  ssh_to "$ip" "$user" "$port" \
+    "sudo sh -c 'cat > /usr/local/bin/devbox-profile.sh; chmod 755 /usr/local/bin/devbox-profile.sh'" <"$pf"
+
+  local start; start=$(date +%s)
+  log "phase 2 running"
+  # set -o pipefail on the REMOTE side. Without it the pipeline's status is tee's, so a
+  # profile that died at the third image build would report success and hand back a
+  # machine with nothing on it.
+  ssh_to "$ip" "$user" "$port" \
+    "set -o pipefail; sudo env DEVBOX_REPO_URL='$REPO_URL' /usr/local/bin/devbox-profile.sh \
+       2>&1 | sudo tee -a /var/log/devbox-profile.log"
+  log "done in $(( ($(date +%s) - start) / 60 )) min $(( ($(date +%s) - start) % 60 ))s"
+  [ -n "${QUIET:-}" ] && return 0
+  echo
+  cmd_info "$name"
+}
+
+# One cloud's offers, or the reason it could not be asked. Credentials missing for GCP
+# must not stop a probe from telling you what Hetzner has: three sets of keys to look at
+# one price list is the trap the spec calls out about three providers in one Terraform
+# root, and it applies here for the same reason.
+# --type narrows the probe's answer rather than bypassing it: pinning a shape that no
+# location can currently create should fail here, not thirty seconds into an apply.
+pin_filter() {
+  if [ -z "$PIN" ]; then cat; else awk -F'\t' -v p="$PIN" '$3 == p'; fi
+}
+
+candidates_for() {
+  case "$1" in
+    hetzner)  hcloud_token     && hz_candidates ;;
+    scaleway) scw_credentials  && scw_candidates ;;
+    gcp)      gcp_token        && gcp_candidates ;;
+  esac
+}
+
+# The running total is the point of this command, not a garnish: the failure mode of a
+# tool that can start three machines is forgetting the third.
+# The fleet as JSON, from wherever this Mac is pointed. Always an array, empty when there
+# is nothing, so a consumer never special-cases "no machine" the way the table has to.
+fleet_json() {
+  if [ -n "$REMOTE" ]; then
+    # The dashboard's fleet, and only it. A workspace left over in the state from before
+    # this Mac was pointed at a dashboard is the server's business, and printing it twice —
+    # once from here, once from the API — is how a fleet of one reads as a fleet of two.
+    remote_api GET /api/machines || exit 1
+    return 0
+  fi
+  state_fleet_json
+}
+
+# The fleet held in the local Terraform state, as an array. Always an array, empty when
+# there is nothing.
+state_fleet_json() {
+  local cloud name list; list=$(instances)
+  { while read -r cloud name; do
+      [ -n "$cloud" ] || continue
+      machine_json "$cloud" "$name" || true
+    done <<<"$list"; } | jq -s '.'
+}
+
+# The table, rendered from that JSON in ONE place. Local and remote therefore cannot drift
+# into printing different columns, which is the whole reason the rendering was lifted out
+# of the loop that used to read Terraform directly.
+#
+# EUR/MO here for the same reason as in `table`, and with the same widths paid for the same
+# way: EUR/H from 8 to 6 and CLOUD from 9 to 8 keep the widest row at 99 characters with a
+# full fifteen-digit address in HOST, where adding the column outright would have made it
+# 102 and folded the address onto its own line.
+fleet_table() {
+  local rows=$1 total name cloud region type profile hourly ip
+  [ "$(jq 'length' <<<"$rows")" != 0 ] || { echo "  no machine"; return 0; }
+  printf '  %-14s %-8s %-16s %-14s %-10s %-6s %-7s %s\n' \
+    NAME CLOUD WHERE SHAPE PROFILE EUR/H EUR/MO HOST
+  while IFS=$'\t' read -r name cloud region type profile hourly ip; do
+    printf '  %-14s %-8s %-16s %-14s %-10s %-6s %-7s %s\n' \
+      "$name" "$cloud" "$region" "$type" "$profile" \
+      "$(eur "$hourly")" "$(eur_month "$hourly")" "$ip"
+  done < <(jq -r '.[] | [.name, .cloud, .region, .instance_type, (.profile // "?"),
+                         (.hourly_eur // 0), .ip] | @tsv' <<<"$rows")
+  total=$(jq '[.[].hourly_eur // 0] | add // 0' <<<"$rows")
+  echo
+  # The month joins the day, it does not take its place. The day is what answers "can I
+  # leave this running over the weekend"; the month is what answers "what did I actually
+  # sign up for", and dropping either one to make room for the other would trade one of
+  # those questions for the other rather than answer both.
+  printf '  total %s EUR/h, or %s EUR a day and %s EUR a month if they all keep running\n' \
+    "$(eur "$total")" "$(awk -v t="$total" 'BEGIN { printf "%.2f", t * 24 }' | tr . ,)" \
+    "$(eur_month "$total")"
+}
+
+cmd_ls() {
+  need jq
+  local json=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --json) json=1; shift ;;
+      *) die "unknown flag: $1" ;;
+    esac
+  done
+
+  local rows; rows=$(fleet_json) || exit 1
+  [ "$json" = 1 ] && { printf '%s\n' "$rows"; return 0; }
+  fleet_table "$rows"
+}
+
+cmd_probe() {
+  need jq; need curl
+  local only='' json=0 max=12
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --cloud)   takes_value "$@"; only=$2; shift 2 ;;
+      --json)    json=1; max=0; shift ;;
+      --all)     max=0; shift ;;
+      --min-cpu|--cpu)   takes_value "$@"; MIN_CORES=$2; cpu_set=1; shift 2 ;;
+      --min-ram|--ram)   takes_value "$@"; MIN_MEMORY_GB=$2; ram_set=1; shift 2 ;;
+      --min-disk|--disk) takes_value "$@"; MIN_DISK_GB=$2; disk_set=1; shift 2 ;;
+      --refresh) rm -f "$CACHE_DIR/gcp-skus.jsonl"; shift ;;
+      *) die "unknown flag for probe: $1" ;;
+    esac
+  done
+
+  local clouds=${only:-$CLOUDS_IMPLEMENTED} c rows all='' errf skipped=''
+  errf=$(mktemp)
+  for c in $clouds; do
+    if rows=$(candidates_for "$c" 2>"$errf"); then
+      [ -n "$rows" ] && all="$all$rows"$'\n'
+    else
+      skipped="$skipped  $c: $(head -1 "$errf" | sed 's/^[^ ]* //')"$'\n'
+    fi
+  done
+  rm -f "$errf"
+  all=$(grep -c . <<<"$all" >/dev/null && sort -g -k1,1 <<<"$all" | grep . || true)
+
+  # The rows on stdout, unchanged: that array is the contract the dashboard and the Ink
+  # layer both read, and nothing may be added to it. The clouds that could not be asked go
+  # to STDERR instead, because "gcp has no credentials here" is real information and the
+  # text screen already printed it — losing it in JSON mode would let one unconfigured
+  # provider silently hide another's cheaper offer.
+  if [ "$json" = 1 ]; then
+    table_json "$all"
+    [ -n "$skipped" ] && { echo "not asked:" >&2; printf '%s' "$skipped" >&2; }
+    return 0
+  fi
+
+  if [ -n "$all" ]; then table "$all" "$max"; else echo "  nothing creatable"; fi
+  [ -n "$skipped" ] && { echo; echo "  not asked:"; printf '%s' "$skipped"; }
+  echo
+  echo "  template: at least ${MIN_CORES} vCPU, ${MIN_MEMORY_GB} GB and ${MIN_DISK_GB} GB of disk."
+  echo "            x86 from the three clouds."
+  echo "            These are FLOORS: everything above is listed, cheapest first, and"
+  echo "            \`up\` takes the first. --min-cpu/--min-ram/--min-disk move them,"
+  echo "            --type pins an exact shape."
+  echo "  price: hourly, as the API returns it right now."
+  echo "         hetzner  server + primary IPv4"
+  echo "         scaleway server, local disk included; no API prices the public IPv4,"
+  echo "                  so it is missing from the total"
+  echo "         gcp      instance + disk, assembled from the billing catalogue"
+  # One sentence, in the block that already explains the prices, and nowhere else. The
+  # honest version of this warning per row would be a footnote on every line of a table
+  # that is read by scanning, which is noise; the dishonest version is no warning at all,
+  # and the measurements above eur_month are what that would cost the reader.
+  echo "         EUR/MO   that same hourly figure carried over 730 h and nothing more, so"
+  echo "                  it is not a quote: Hetzner caps the hours it bills in a month and"
+  echo "                  charges around 17 % less than this column says."
+  if [ -s "$CACHE_DIR/gcp-skus.jsonl" ]; then
+    echo "  GCP price cache: $(date -r "$CACHE_DIR/gcp-skus.jsonl" '+%d/%m %H:%M') — --refresh to renew"
+  fi
+  echo "  availability: published by Hetzner and Scaleway. GCP publishes none, hence"
+  echo "                'unknown': only the regional quota before, the error during."
+}
+
+# What a provider says it is running under the devbox label, one JSON object per server.
+#
+# The shape is deliberately thin — name, address, where, when — because it is only ever
+# compared against the state and printed. Anything more would be a second, weaker copy of
+# the seven-output contract.
+cloud_servers() {
+  case "$1" in
+    hetzner)
+      hcloud_token
+      hz_all servers servers | jq -c '
+        .servers[] | select(.labels["managed-by"] == "devbox")
+        | { cloud: "hetzner", name: .name, ip: (.public_net.ipv4.ip // null),
+            region: (.datacenter.location.name // "?"), created: (.created // "?") }'
+      ;;
+    scaleway)
+      scw_credentials
+      local z
+      for z in $SCALEWAY_ZONES; do
+        scw_api "$z" servers | jq -c --arg z "$z" '
+          .servers[] | select((.tags // []) | index("devbox"))
+          | { cloud: "scaleway", name: .name,
+              ip: (.public_ip.address // (.public_ips[0].address? // null)),
+              region: $z, created: (.creation_date // "?") }'
+      done
+      ;;
+    gcp)
+      gcp_token
+      # aggregated/instances answers with a zone key per zone, most of them holding a
+      # `warning` and no `instances` at all, hence the // [].
+      gcp_api "https://compute.googleapis.com/compute/v1/projects/$GCP_PROJECT/aggregated/instances" \
+        | jq -c '
+          (.items // {}) | to_entries[] | (.value.instances // [])[]
+          | select(((.tags.items) // []) | index("devbox"))
+          | { cloud: "gcp", name: .name,
+              ip: (.networkInterfaces[0].accessConfigs[0].natIP? // null),
+              region: (.zone | split("/") | last), created: (.creationTimestamp // "?") }'
+      ;;
+    *) die "unknown cloud: $1" ;;
+  esac
+}
+
+# Every machine a provider is running that no state knows about.
+#
+# This is the one failure of this tool that costs money in silence. An apply killed
+# halfway — a lost connection here, a `systemctl restart` under the dashboard there —
+# leaves a server running with nothing recording it, and no other screen will ever show
+# it again. `down` already asks the provider, but only once the last machine is gone,
+# which is precisely the case where nothing is left to trigger it.
+#
+# Matched on name AND address: the workspace is named after its machine, but the legacy
+# `default` workspace is not, so the address is what makes the comparison exact.
+cmd_orphans() {
+  need jq; need curl
+  local only='' json=0
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --cloud) takes_value "$@"; only=$2; shift 2 ;;
+      --json)  json=1; shift ;;
+      *) die "unknown flag for orphans: $1" ;;
+    esac
+  done
+
+  local orphans='' skipped=''
+
+  if [ -n "$REMOTE" ]; then
+    # The dashboard holds the state AND the credentials, so it is the only place where the
+    # comparison means anything. Asking from here against the local state would call every
+    # machine the server created an orphan.
+    orphans=$(remote_api GET /api/orphans) || exit 1
+  else
+    local known; known=$(cmd_ls --json)
+
+    # The same posture as probe: a cloud whose credentials are missing is named and
+    # skipped, never fatal. One unconfigured provider must not hide another's runaway
+    # machine.
+    local clouds=${only:-$CLOUDS_IMPLEMENTED} c rows all='' errf
+    errf=$(mktemp)
+    for c in $clouds; do
+      if rows=$(cloud_servers "$c" 2>"$errf"); then
+        [ -n "$rows" ] && all="$all$rows"$'\n'
+      else
+        skipped="$skipped  $c: $(head -1 "$errf" | sed 's/^[^ ]* //')"$'\n'
+      fi
+    done
+    rm -f "$errf"
+
+    # The server is bound to $server before anything is piped. `. | index(.name)` was the
+    # first version and it reads correctly and is wrong: after the pipe `.` is the list of
+    # known names, so `.name` indexed an array with a string and jq left with 5. It only
+    # ever ran when a provider answered at least one devbox server — which is to say, the
+    # command reported "no orphan" happily and broke in the only case it exists for.
+    orphans=$(printf '%s' "$all" | jq -s --argjson known "$known" '
+      map(. as $server | select(
+        ($known | any(.name == $server.name)) == false
+        and ($server.ip == null or ($known | any(.ip == $server.ip)) == false)
+      ))')
+  fi
+
+  # Same rule as probe: the array on stdout is the contract, the clouds that could not be
+  # asked go to stderr. Silence there would be the worst possible answer — "no orphan" and
+  # "I could not look" must never render the same.
+  if [ "$json" = 1 ]; then
+    printf '%s\n' "$orphans"
+    [ -n "$skipped" ] && { echo "not asked:" >&2; printf '%s' "$skipped" >&2; }
+    return 0
+  fi
+
+  local n; n=$(jq 'length' <<<"$orphans")
+  if [ "$n" = 0 ]; then
+    echo "  no orphan: every server the providers run is in the state"
+  else
+    warn "$n server(s) running that no state knows about, and they are billing"
+    printf '  %-16s %-9s %-16s %-18s %s\n' NAME CLOUD WHERE CREATED HOST
+    jq -r '.[] | [.name, .cloud, .region, (.created[0:16]), (.ip // "-")] | @tsv' <<<"$orphans" \
+      | awk -F'\t' '{ printf "  %-16s %-9s %-16s %-18s %s\n", $1, $2, $3, $4, $5 }'
+    echo
+    echo "  Destroy them from the provider console, or adopt one into a workspace:"
+    echo "    TF_WORKSPACE=<name> terraform -chdir=$TF_ROOT/<cloud> import ..."
+  fi
+  [ -n "$skipped" ] && { echo; echo "  not asked:"; printf '%s' "$skipped"; }
+  return 0
+}
+
+cmd_down() {
+  # A loop, not two `case` statements on $1 and $2. Those read the first two arguments and
+  # threw the rest away without a word: `devbox down alpha beta` destroyed alpha, left beta
+  # billing, and exited 0 — the owner having every reason to believe both were gone. And a
+  # mistyped flag reached `resolve`, which answered "no machine named '--quiett'", the
+  # right exit code behind the wrong explanation. Every other verb here refuses what it
+  # does not understand; this one now does too, and it is the verb that destroys work.
+  local want=''
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --quiet) QUIET=1; shift ;;
+      '') shift ;;
+      -*) die "unknown flag for down: $1" ;;
+      *) [ -z "$want" ] || die "down destroys one machine at a time, and you named two: $want and $1"
+         want=$1; shift ;;
+    esac
+  done
+  set -- "$want"
+
+  # Delegated, with the same two local gestures on the way back: forget the host key and
+  # drop the Host block. The address and the port are read BEFORE the destroy, since after
+  # it there is nothing left to ask.
+  local where pick; pick=$(resolve_any "$want") || exit 1
+  read -r where want <<<"$pick"
+  set -- "$want"
+  if [ "$where" = remote ]; then
+    need jq
+    local rname d rip rport id target
+    rname=$want
+    d=$(remote_api GET "/api/machines/$rname") || exit 1
+    rip=$(field_of "$d" ip); rport=$(field_of "$d" port)
+    id=$(remote_api POST "/api/machines/$rname/destroy" \
+           "$(jq -n --arg n "$rname" '{ confirm: $n }')" | jq -r '.job')
+    log "$REMOTE, job $id"
+    remote_follow "$id"
+    if [ -n "$rip" ]; then
+      target=$rip; [ "${rport:-22}" = 22 ] || target="[$rip]:$rport"
+      ssh-keygen -f "$KNOWN_HOSTS" -R "$target" >/dev/null 2>&1 || true
+    fi
+    with_lock drop_ssh_config "$rname"
+    log "$rname destroyed. Meter stopped."
+    return 0
+  fi
+
+  local cloud name
+  # Assigned first, never inlined into the here-string, for the reason `detail_json`
+  # gives: a `die` inside a substitution only kills that subshell. `read` would then
+  # succeed on the empty line it was handed, and the refusal to guess would be
+  # followed by the command carrying on with an empty cloud and an empty name.
+  pick=$(resolve "${1:-}") || exit 1
+  read -r cloud name <<<"$pick"
+  local o ip port
+  o=$(outputs "$cloud" "$name")
+  ip=$(out "$o" ip); port=$(out "$o" port)
+
+  # Destroy, never stop. Hetzner bills a powered-off server at full price, Scaleway bills
+  # its volume and IP, GCP its disk: three different regimes, so a verb that means three
+  # different things is a trap on a bill.
+  # The variables have no defaults — deliberately, so no wrong constant can be baked in —
+  # and `terraform destroy` demands every one of them anyway. Fed back from the state's
+  # own outputs, because the first version passed none and died on "input variable
+  # hourly_eur is not set", leaving the server running and the meter with it. A down that
+  # can fail halfway is worse than no down at all.
+  case "$cloud" in
+    gcp)
+      gcp_token
+      tf "$cloud" "$name" destroy -auto-approve -input=false \
+        -var "name=$name" \
+        -var "project=$GCP_PROJECT" \
+        -var "machine_type=$(out "$o" instance_type | sed 's#.*/##')" \
+        -var "zone=$(out "$o" region | sed 's#.*/##')" \
+        -var "region=$(out "$o" region | sed 's#.*/##; s/-[a-z]$//')" \
+        -var "boot_disk_gb=$MIN_DISK_GB" \
+        -var "hourly_eur=$(out "$o" hourly_eur)" \
+        -var "ssh_public_key=$(cat "$KEY.pub")"
+      ;;
+    scaleway)
+      scw_credentials
+      tf "$cloud" "$name" destroy -auto-approve -input=false \
+        -var "name=$name" \
+        -var "instance_type=$(out "$o" instance_type)" \
+        -var "zone=$(out "$o" region)" \
+        -var "region=$(out "$o" region | sed 's/-[0-9]*$//')" \
+        -var "root_volume_gb=$MIN_DISK_GB" \
+        -var "hourly_eur=$(out "$o" hourly_eur)" \
+        -var "ssh_public_key=$(cat "$KEY.pub")"
+      ;;
+    hetzner)
+      hcloud_token
+      tf "$cloud" "$name" destroy -auto-approve -input=false \
+        -var "name=$name" \
+        -var "server_type=$(out "$o" instance_type)" \
+        -var "location=$(out "$o" region)" \
+        -var "hourly_eur=$(out "$o" hourly_eur)" \
+        -var "ssh_public_key=$(cat "$KEY.pub")"
+      ;;
+  esac
+
+  # Belt and braces, because this is the command that stops the money: Terraform reports
+  # on its own state, this asks the cloud. Only worth doing once the last machine is gone —
+  # with two still running, "2 servers left" is the correct answer, not a warning.
+  if [ -n "$(instances)" ]; then
+    log "other machines are still running: $(instances | awk '{print $2}' | tr '\n' ' ')"
+    return 0
+  fi
+  case "$cloud" in
+    hetzner)
+      local left
+      left=$(hz_all servers servers | jq '[.servers[] | select(.labels["managed-by"] == "devbox")] | length')
+      [ "$left" = 0 ] || warn "$left devbox server(s) still exist in the Hetzner project — check the console"
+      ;;
+    gcp)
+      # Instances and disks. The boot disk carries auto_delete, but a disk that outlived
+      # its instance is the one thing here that bills silently, so it gets asked about.
+      local n
+      for n in instances disks; do
+        local c
+        c=$(gcp_api "https://compute.googleapis.com/compute/v1/projects/$GCP_PROJECT/aggregated/$n" \
+            | jq --arg n "$n" '[ .items[]?[$n][]? | select(.name | startswith("devbox")) ] | length')
+        [ "$c" = 0 ] || warn "$c $n named devbox* left in $GCP_PROJECT — check the console"
+      done
+      ;;
+    scaleway)
+      # Servers, volumes AND ips: on Scaleway the last two bill on their own once
+      # orphaned, so listing only servers would report "clean" on a machine still costing
+      # money every hour.
+      local z n
+      for z in $SCALEWAY_ZONES; do
+        for n in servers volumes ips; do
+          local c
+          c=$(scw_api "$z" "$n" | jq --arg n "$n" '.[$n] | length')
+          [ "$c" = 0 ] || warn "$c $n left in $z — check the Scaleway console"
+        done
+      done
+      ;;
+  esac
+
+  if [ -n "$ip" ]; then
+    local target=$ip; [ "$port" = 22 ] || target="[$ip]:$port"
+    ssh-keygen -f "$KNOWN_HOSTS" -R "$target" >/dev/null 2>&1 || true
+  fi
+  with_lock drop_ssh_config "$name"
+
+  # The workspace goes with the machine, or `devbox ls` keeps listing an empty shell. It
+  # cannot be deleted from inside itself, hence the hop through default.
+  # Under the lock too: `workspace delete` touches the root's shared metadata, and three
+  # concurrent deletes left one workspace behind.
+  if [ "$name" != default ]; then
+    with_lock env TF_WORKSPACE=default \
+      terraform -chdir="$TF_ROOT/$cloud" workspace delete -force "$name" >/dev/null 2>&1 || true
+  fi
+  [ -n "${QUIET:-}" ] || log "$name destroyed. Meter stopped."
+}
+
+# The deployment gap, checked once per invocation. Here rather than inside remote_api,
+# because half of that function's callers invoke it inside a `$( )` — a "already asked"
+# flag set there would die with the subshell, and remote_follow polls every two seconds.
+# Before the dispatch, "once" is a property of the position and not of a flag, and the
+# warning lands before the first `==>` rather than in the middle of a job log.
+#
+# An allowlist and not an exclusion, so a local verb added later does not quietly start
+# paying for a round trip: probe never calls remote_api, and --help has to stay answerable
+# with no network at all.
+if [ -n "$REMOTE" ]; then
+  case "${1:-}" in up|seed|down|ls|info|profiles|orphans|sync|tunnel) version_gate ;; esac
+fi
+
+case "${1:-}" in
+  up)    shift; cmd_up "$@" ;;
+  info)  shift; cmd_info "$@" ;;
+  seed)  shift; cmd_seed "$@" ;;
+  ls)    shift; cmd_ls "$@" ;;
+  profiles) shift; cmd_profiles "$@" ;;
+  probe) shift; cmd_probe "$@" ;;
+  orphans) shift; cmd_orphans "$@" ;;
+  tunnel) shift; cmd_tunnel "$@" ;;
+  ssh)   shift; cmd_ssh "$@" ;;
+  sync)  shift; cmd_sync "$@" ;;
+  down)  shift; cmd_down "$@" ;;
+  ''|-h|--help|help)
+    # The whole leading comment block, however long it grows. A fixed line range was the
+    # first version, and it truncated the usage mid-sentence the day the header grew.
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}" ;;
+  *) die "unknown command: $1 (up, seed, info, ls, profiles, probe, orphans, ssh, sync, tunnel, down)" ;;
+esac

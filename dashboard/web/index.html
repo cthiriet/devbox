@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- viewport-fit=cover: without it, the iPhone home bar eats the bottom of the page,
+         and env(safe-area-inset-bottom) is zero in the stylesheets.
+
+         interactive-widget=resizes-content: Chromium shrinks the LAYOUT viewport when the
+         virtual keyboard opens, which is what makes `fixed inset-0` and svh mean "above the
+         keyboard" there for free. Safari does not implement it, hence the visualViewport
+         effect in components/terminal.tsx - this attribute costs nothing and spares Android
+         from depending on it. -->
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content"
+    />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="robots" content="noindex, nofollow" />
+    <!-- The mark, for one tab among twenty. Inline, because one more file served by Caddy
+         for sixteen pixels is not worth it. Written here by brand/build.ts, along with
+         components/logo.tsx: a favicon copied by hand is a favicon that drifts, and a tab
+         disagreeing with the page it opens reports to no one. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22 viewBox%3D%220 0 64 64%22%3E%3Crect width%3D%2264%22 height%3D%2264%22 rx%3D%2214%22 fill%3D%22%230B0F14%22%2F%3E%3Cg transform%3D%22translate(32 32) scale(0.72) translate(-32 -32) translate(-2 -2)%22%3E%3Cg transform%3D%22translate(4 4)%22%3E%3Cpath fill-rule%3D%22evenodd%22 fill%3D%22%233FB950%22 d%3D%22M41%2C6 H52 V58 H24 A12%2C12 0 0 1 12%2C46 V33 A12%2C12 0 0 1 24%2C21 H41 Z M28%2C32 H36 A5%2C5 0 0 1 41%2C37 V42 A5%2C5 0 0 1 36%2C47 H28 A5%2C5 0 0 1 23%2C42 V37 A5%2C5 0 0 1 28%2C32 Z%22%2F%3E%3C%2Fg%3E%3Cpath fill-rule%3D%22evenodd%22 fill%3D%22%23FAFAFA%22 d%3D%22M41%2C6 H52 V58 H24 A12%2C12 0 0 1 12%2C46 V33 A12%2C12 0 0 1 24%2C21 H41 Z M28%2C32 H36 A5%2C5 0 0 1 41%2C37 V42 A5%2C5 0 0 1 36%2C47 H28 A5%2C5 0 0 1 23%2C42 V37 A5%2C5 0 0 1 28%2C32 Z%22%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E"
+    />
+    <title>devbox</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

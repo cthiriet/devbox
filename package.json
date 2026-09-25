@@ -1,0 +1,8 @@
+{
+  "name": "devbox",
+  "private": true,
+  "workspaces": ["cli", "dashboard"],
+  "scripts": {
+    "test": "bun test --cwd cli && bun test --cwd dashboard"
+  }
+}

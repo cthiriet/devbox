@@ -1,0 +1,5 @@
+[test]
+# The tests must never read the operator's real ~/.config/devbox, and must never reach a
+# cloud: everything under src/ that touches either is fed a fixture instead. See
+# tests/prepare.ts.
+preload = ["./tests/prepare.ts"]

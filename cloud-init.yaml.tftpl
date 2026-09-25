@@ -1,0 +1,77 @@
+#cloud-config
+# Phase 1: everything that needs no secret. This is the toolchain of images/dev/build.sh
+# plus the upper half of profiles/full.sh — both on the kubevirt branch — transposed:
+# same packages, same order, same reasons.
+#
+# THIS IS A TERRAFORM TEMPLATE. Every $${...} in here is read by templatefile() as an
+# interpolation. The only three real interpolations are ssh_public_key, prelude_b64 and
+# provision_b64. Anything you add that genuinely needs braces has to be written $$${...},
+# and forgetting it fails loudly at plan time rather than quietly at boot.
+#
+# There is no shell left in this file, and that is new: the phase itself now lives in
+# devbox-provision.sh beside this template, deposited in base64 like prelude.sh. What this
+# file still holds is the account, its key, and the two deposits — everything cloud-init
+# is uniquely good at, and nothing a second substrat would have to reimplement.
+#
+# cloud-init runs this ONCE. The phase is left on the machine at
+# /usr/local/bin/devbox-provision.sh and stays re-runnable by hand when a first boot dies
+# partway:  ssh <machine> 'sudo /usr/local/bin/devbox-provision.sh'
+
+users:
+  - name: dev
+    shell: /bin/bash
+    sudo: 'ALL=(ALL) NOPASSWD:ALL'
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+
+# The only account is dev, and it is reached by key alone. Devbox's firewall opens
+# SSH to the whole internet on purpose — a mobile address changes at every reconnection
+# and a rule pinning it locks you out — so what is exposed had better be an sshd that
+# accepts nothing but a key.
+disable_root: true
+ssh_pwauth: false
+
+write_files:
+  # Pinned rather than trusted to the base image's default: a future image change must
+  # not be able to quietly re-enable password login on the only way in.
+  - path: /etc/ssh/sshd_config.d/99-devbox.conf
+    permissions: '0644'
+    content: |
+      PermitRootLogin no
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+
+  # What every profile can assume is already there. The profile ITSELF is not here: it
+  # travels at `devbox seed`, over the SSH channel, alongside the secrets it declares. That
+  # is what lets a machine be re-provisioned with a different profile without recreating
+  # it, and it keeps the user-data — which is readable from inside the VM through the
+  # metadata service — down to what carries no choice and no secret.
+  #
+  # base64 because this is shell inside YAML inside a Terraform template, and all three
+  # layers have an opinion about quoting.
+  #
+  # gzip under the base64, because Hetzner refuses a user_data over 32768 bytes when the
+  # server is created. Measured on 17/09: once the prelude had grown from 11 to 31 KB, this
+  # file rendered to 50687 bytes and every Hetzner order died at apply, whatever the
+  # profile; gzipped, 21291. Every root must say base64gzip() for what lands here, or
+  # cloud-init fails to inflate it. dashboard/tests/user-data.test.ts holds both.
+  - path: /usr/local/lib/devbox/prelude.sh
+    permissions: '0644'
+    encoding: gz+b64
+    content: ${prelude_b64}
+
+  # The phase itself, deposited exactly like the prelude above and for the same reasons:
+  # base64, because this is shell inside YAML inside a Terraform template and all three
+  # layers have an opinion about quoting, and gzip for the ceiling.
+  #
+  # It used to be written out in full RIGHT HERE, which made it re-runnable by nothing and
+  # reachable from nothing that is not cloud-init. Lifted into its own file it is deposited
+  # from here and stays testable by hand — its own header says the rest.
+  - path: /usr/local/bin/devbox-provision.sh
+    permissions: '0755'
+    encoding: gz+b64
+    content: ${provision_b64}
+
+runcmd:
+  - [ /usr/local/bin/devbox-provision.sh ]
