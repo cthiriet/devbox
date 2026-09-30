@@ -438,6 +438,9 @@ PROFILE
   # exists to be handed a long task and left alone, and an agent that thinks less to answer
   # faster is optimising for the one thing nobody is waiting on here.
   #
+  # model opus, the alias and not a model's name: it follows each new Opus, where a name pinned
+  # here (claude-opus-5 until 30/09) stayed on the old one once a newer shipped.
+  #
   # defaultMode auto, and it is a statement about THIS machine rather than a preference: it
   # holds no production access, it is reached through one SSH key, and it is destroyed at
   # the end of the day. An agent that stops to ask is asking nobody. Change it in your copy
@@ -445,7 +448,7 @@ PROFILE
   mkdir -p "$HOME_DIR/.claude"
   cat > "$HOME_DIR/.claude/settings.json" <<'JSON'
 {
-  "model": "claude-opus-5",
+  "model": "opus",
   "effortLevel": "xhigh",
   "theme": "auto",
   "permissions": {
